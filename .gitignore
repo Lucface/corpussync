@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.log
+channels.txt
+.corpussync/
+.DS_Store

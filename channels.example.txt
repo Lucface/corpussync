@@ -1,0 +1,4 @@
+# CorpusSync channels — one per line:  source|@handle|channel-videos-URL
+# `source` becomes the Qdrant collection name (<source>-corpus). Copy to channels.txt and edit.
+aiengineer|@aiDotEngineer|https://www.youtube.com/@aiDotEngineer/videos
+ycombinator|@ycombinator|https://www.youtube.com/@ycombinator/videos
