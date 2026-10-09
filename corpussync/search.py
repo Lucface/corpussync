@@ -154,7 +154,7 @@ def search(ctx, query: str, corpora: list[str], k: int = 8, mode: str = "hybrid"
                 if not sparse.indices:
                     continue
                 kwargs.update(query=sparse, using="bm25")
-            elif mode == "hybrid" and layout == "hybrid":
+            elif mode == "hybrid" and layout == "hybrid" and sparse.indices:
                 kwargs.update(
                     prefetch=[
                         Prefetch(query=dense, using="dense", limit=limit),
@@ -163,7 +163,7 @@ def search(ctx, query: str, corpora: list[str], k: int = 8, mode: str = "hybrid"
                     query=FusionQuery(fusion=Fusion.RRF),
                 )
             else:
-                if mode == "hybrid":
+                if mode == "hybrid" and layout != "hybrid":
                     result.notices.append(f"{corpus}: --mode hybrid needs a fresh corpus (remove then ingest again)")
                 kwargs["query"] = dense
                 if prefixed:
@@ -213,7 +213,7 @@ def search(ctx, query: str, corpora: list[str], k: int = 8, mode: str = "hybrid"
         hits = sorted((hit for hit, _rank in candidates), key=lambda hit: (-hit.relevance, _tie(hit)))
         if mode == "hybrid":
             keyword_hits = sorted(
-                (hit for hit in hits if hit.keyword_coverage >= keyword_floor),
+                (hit for hit in hits if sparse.indices and hit.keyword_coverage >= keyword_floor),
                 key=lambda hit: (-hit.keyword_coverage, -hit.relevance, _tie(hit)),
             )
             keyword_ranks = {id(hit): rank for rank, hit in enumerate(keyword_hits, 1)}

@@ -33,7 +33,7 @@ def _missing_extra(path: Path, extra: str) -> None:
 
 
 def _read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8", errors="replace")
+    return path.read_text(encoding="utf-8-sig", errors="replace")
 
 
 def _markdown_title(text: str) -> str | None:

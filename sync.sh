@@ -150,7 +150,7 @@ if [ "${#CHANNELS[@]}" -eq 0 ]; then
   exit 0
 fi
 
-NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$'
+NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,55}$'
 failed=0
 for entry in "${CHANNELS[@]}"; do
   SOURCE="${entry%%|*}"
@@ -171,11 +171,31 @@ for entry in "${CHANNELS[@]}"; do
     > "$DATA_DIR/$SOURCE/video-list.tsv" 2>/dev/null || { echo "  list refresh failed"; failed=$((failed + 1)); continue; }
   cut -f1 "$DATA_DIR/$SOURCE/video-list.tsv" > "$DATA_DIR/$SOURCE/all-ids.txt"
 
+  SKIP_SET=$(mktemp "$DATA_DIR/$SOURCE/no-captions-skip.XXXXXX") || { failed=$((failed + 1)); continue; }
+  MISS_INPUT="$NO_CAPTIONS"
+  [ -f "$MISS_INPUT" ] || MISS_INPUT=/dev/null
+  if ! awk -F '\t' -v now="$(date +%s)" '
+    NF && $1 != "" {
+      time = ($2 ~ /^[0-9]+$/) ? $2 + 0 : 0
+      if (!($1 in lowest) || time < lowest[$1]) lowest[$1] = time
+      if (!($1 in highest) || time > highest[$1]) highest[$1] = time
+    }
+    END {
+      for (id in highest)
+        if (highest[id] - lowest[id] >= 172800 || now - highest[id] < 172800)
+          print id
+    }
+  ' "$MISS_INPUT" > "$SKIP_SET"; then
+    rm -f "$SKIP_SET"
+    failed=$((failed + 1))
+    continue
+  fi
+
   pulled=0
   while IFS= read -r vid; do
     [ -z "$vid" ] && continue
     ls "$CAP_DIR/$vid".*.vtt >/dev/null 2>&1 && continue
-    if [ -f "$NO_CAPTIONS" ] && grep -Fqx -- "$vid" "$NO_CAPTIONS"; then
+    if grep -Fqx -- "$vid" "$SKIP_SET"; then
       continue
     fi
     [ "$pulled" -ge "$PER_RUN_CAP" ] && break
@@ -186,14 +206,15 @@ for entry in "${CHANNELS[@]}"; do
       ok=0
     fi
     if [ "$ok" -eq 1 ] && ! ls "$CAP_DIR/$vid".*.vtt >/dev/null 2>&1; then
-      printf '%s\n' "$vid" >> "$NO_CAPTIONS"
+      printf '%s\t%s\n' "$vid" "$(date +%s)" >> "$NO_CAPTIONS"
     fi
     pulled=$((pulled + 1))
   done < "$DATA_DIR/$SOURCE/all-ids.txt"
+  rm -f "$SKIP_SET"
   echo "  pulled up to $pulled new caption files"
 
-  if ! "$PYBIN" "$INGEST" --captions "$CAP_DIR" --titles "$DATA_DIR/$SOURCE/video-list.tsv" \
-    --source "$SOURCE" --channel "$HANDLE"; then
+  if ! "$PYBIN" "$INGEST" --captions="$CAP_DIR" --titles="$DATA_DIR/$SOURCE/video-list.tsv" \
+    --source="$SOURCE" --channel="$HANDLE"; then
     failed=$((failed + 1))
   fi
 done

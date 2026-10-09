@@ -34,7 +34,7 @@ Tests are offline. They set `CORPUSSYNC_EMBEDDER=fake` and `CORPUSSYNC_CHAT=fake
 - `channels.example.txt` uses placeholder handles only (`@YourChannel`, `mychannel`).
 - `setup.cfg` defines the package, the `corpussync` console script, and the extras. `setup.py` supports older editable installers. The root shim is not packaged.
 
-On Python 3.9 and 3.10, `corpussync.toml` is read by the minimal parser in `corpussync/config.py`. Python 3.11 and newer use `tomllib`. Every Python module starts after its docstring with `from __future__ import annotations` and stays compatible with Python 3.9 syntax.
+Python 3.11 and newer read `corpussync.toml` with `tomllib`. Python 3.9 and 3.10 use `tomli`, a runtime dependency there. Every Python module starts after its docstring with `from __future__ import annotations` and stays compatible with Python 3.9 syntax.
 
 ## Text rules
 

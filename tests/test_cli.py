@@ -11,6 +11,42 @@ from corpussync.config import load_settings
 from tests.conftest import REPO, run_cli
 
 
+@pytest.mark.parametrize("selection", [["--all"], ["--corpus", "missing"], ["--collection", "notes-corpus"]])
+def test_search_json_no_match_is_one_object(ctx, capsys, selection):
+    """source: round 5 item 1, every no-match JSON search including no selection emits one object."""
+    from corpussync.cli import _parser, cmd_search
+    from corpussync.store import ensure_collection
+
+    if selection == ["--collection", "notes-corpus"]:
+        ensure_collection(ctx.client, "notes-corpus", ctx.settings.embed_dim)
+    capsys.readouterr()
+    args = _parser().parse_args(["search", "unmatched", "--json", *selection])
+    assert cmd_search(ctx, args) == 2
+    output = capsys.readouterr()
+    suffix = " " + selection[1] if len(selection) == 2 else ""
+    assert json.loads(output.out) == {
+        "query": "unmatched", "mode": "hybrid", "results": [], "coverage": {},
+        "message": "no good match in:" + suffix,
+    }
+    assert len(output.out.splitlines()) == 1
+
+
+def test_search_json_without_selection_is_a_usage_error(ctx, capsys):
+    """source: round 5 review, search --json with no corpus selection exits 1 like the text path and prints one error object."""
+    from corpussync.cli import _parser, cmd_search
+
+    capsys.readouterr()
+    args = _parser().parse_args(["search", "anything", "--json"])
+    assert cmd_search(ctx, args) == 1
+    output = capsys.readouterr()
+    assert json.loads(output.out) == {
+        "query": "anything", "mode": "hybrid", "results": [], "coverage": {},
+        "error": "pass --corpus NAME, --collection NAME or --all",
+    }
+    assert len(output.out.splitlines()) == 1
+    assert "pass --corpus NAME, --collection NAME or --all" in output.err.splitlines()
+
+
 @pytest.mark.parametrize("answer_model,pulled,missing", [
     ("llama3.2", [], True),
     ("llama3.2", ["llama3.2"], False),
@@ -43,6 +79,32 @@ def test_doctor_answer_model_is_warning_only(ctx, monkeypatch, capsys, answer_mo
     else:
         assert "warning: answer model" not in output
     assert calls == ["http://127.0.0.1:11434/api/tags"]
+
+
+def test_search_json_all_failures_is_one_error_object(ctx, tmp_path, monkeypatch, capsys):
+    """source: round 5 item 1, failed searches emit bounded JSON errors and retain stderr diagnostics."""
+    from corpussync.cli import _parser, cmd_search
+    from corpussync.ingest import ingest_document
+
+    for corpus in ("first", "second"):
+        ingest_document(ctx, text="five words make this note", source_file=str(tmp_path / corpus),
+                        corpus=corpus, title=corpus, locator=corpus)
+    error = "store unavailable " + "x" * 160
+
+    def fail(**kwargs):
+        raise RuntimeError(error if kwargs["collection_name"] == "first-corpus" else "second error")
+
+    monkeypatch.setattr(ctx.client, "query_points", fail)
+    capsys.readouterr()
+    args = _parser().parse_args(["search", "five words", "--json", "--all"])
+    assert cmd_search(ctx, args) == 1
+    output = capsys.readouterr()
+    assert json.loads(output.out) == {
+        "query": "five words", "mode": "hybrid", "results": [], "coverage": {},
+        "error": error[:120],
+    }
+    assert len(output.out.splitlines()) == 1
+    assert output.err.splitlines()[-1] == "could not search: " + error[:120]
 
 
 def test_help_lists_commands():
@@ -140,6 +202,16 @@ def test_cli_offline_flow(tmp_path):
     assert "notes" not in after.stdout
 
 
+@pytest.mark.parametrize("selection", [[], ["--corpus", "missing"], ["--collection", "missing"]])
+def test_stats_missing_and_empty_store_exit_codes(home, tmp_path, selection):
+    """source: round 5 item 2, selected missing corpora exit two while an unselected empty store succeeds."""
+    home.chmod(0o700)
+    proc = run_cli(["stats", *selection], home, tmp_path)
+    assert proc.returncode == (2 if selection else 0), proc.stderr
+    assert proc.stdout == ("missing: not found\n" if selection else "no corpora\n")
+    assert proc.stderr == ""
+
+
 def test_env_overrides_toml(tmp_path, monkeypatch):
     """source: defect 20, explicit config is read with environment taking precedence."""
     wanted = tmp_path / "from-toml"
@@ -157,6 +229,35 @@ def test_env_overrides_toml(tmp_path, monkeypatch):
     assert settings.answer_model == "llama3.2"
 
 
+@pytest.mark.parametrize("command", ["direct", "stats", "compat"])
+@pytest.mark.parametrize("failure", ["list", "count"])
+def test_stats_store_errors_exit_one(ctx, monkeypatch, capsys, command, failure):
+    """source: round 5 item 2, store and count failures are bounded stderr errors for both CLIs."""
+    from corpussync.cli import main, main_compat, stats_collection
+    from corpussync.store import ensure_collection
+
+    ensure_collection(ctx.client, "notes-corpus", ctx.settings.embed_dim)
+    error = "store unavailable " + "x" * 160
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(error)
+
+    monkeypatch.setattr(ctx.client, "get_collections" if failure == "list" else "count", fail)
+    monkeypatch.setattr("corpussync.store.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("corpussync.cli.load_context", lambda *args: ctx)
+    if command == "direct":
+        status = stats_collection(ctx, "notes-corpus")
+    elif command == "compat":
+        status = main_compat(["--source", "notes", "--stats"])
+    else:
+        status = main(["stats", "--collection", "notes-corpus", "--collection", "missing"])
+    assert status == 1
+    output = capsys.readouterr()
+    assert "could not read notes-corpus: " + error[:120] in output.err.splitlines()
+    assert "notes-corpus: not found" not in output.out
+    assert "Traceback" not in output.err
+
+
 def test_remove_missing_never_deletes(ctx, monkeypatch, capsys):
     """source: defect 1, removing an absent collection returns 1 without calling delete."""
     from corpussync.cli import cmd_remove
@@ -166,6 +267,22 @@ def test_remove_missing_never_deletes(ctx, monkeypatch, capsys):
     assert cmd_remove(ctx, None, True, "missing") == 1
     assert capsys.readouterr().out == "missing: not found\n"
     assert called == []
+
+
+def test_stats_checks_collection_membership_before_count(ctx, monkeypatch, capsys):
+    """source: round 5 item 2, missing collections are detected by listing without metadata or count calls."""
+    from corpussync.cli import stats_collection
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("missing collection should not be read")
+
+    monkeypatch.setattr(ctx.client, "get_collection", unexpected)
+    monkeypatch.setattr(ctx.client, "count", unexpected)
+    capsys.readouterr()
+    assert stats_collection(ctx, "missing") == 2
+    output = capsys.readouterr()
+    assert output.out == "missing: not found\n"
+    assert output.err == ""
 
 
 def test_exact_stats_and_remove_scope(ctx, tmp_path, capsys):

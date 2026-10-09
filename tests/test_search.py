@@ -110,6 +110,19 @@ def test_ask_does_not_call_the_model_below_the_floor(ctx, tmp_path, capsys):
     assert "no good match in: notes" in capsys.readouterr().out
 
 
+def test_ask_chat_failure_uses_stderr(ctx, tmp_path, capsys):
+    """source: round 5 item 4, chat failures return one with a diagnostic only on stderr."""
+    ingest_document(ctx, text="five words make this note", source_file=str(tmp_path / "note"),
+                    corpus="notes", title="Note", locator="note")
+    ctx.chat = _BoomChat()
+    capsys.readouterr()
+    assert ask(ctx, "five words", ["notes"]) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == "chat failed: model was called\n"
+    assert ctx.chat.calls == 1
+
+
 def test_legacy_collection_searches_dense_with_notice(ctx, tmp_path):
     """source: a 0.1-layout collection searches in dense mode and prints the hybrid notice."""
     text = "legacy dense search keeps this caption text available for the corpus"
@@ -216,6 +229,37 @@ def test_keyword_mode_never_calls_closed_embedder(ctx, tmp_path, monkeypatch):
     assert result.results and result.results[0].keyword_coverage == 1.0
     assert result.results[0].relevance is None
     assert calls == []
+
+
+@pytest.mark.parametrize("query", ["what is it", "a b c", "?!..."])
+@pytest.mark.parametrize("keyword_floor", [1.0, 0.0])
+def test_hybrid_empty_keywords_query_dense_without_prefetch(ctx, tmp_path, monkeypatch, query, keyword_floor):
+    """source: round 5 item 5, tokenless hybrid queries return dense hits without empty sparse prefetch or keyword rank."""
+    text = "five words make this note"
+    ctx.embedder = _ControlledEmbedder(ctx.settings.embed_dim, {text: 0.9})
+    ctx.settings.min_score["keyword"] = keyword_floor
+    for corpus in ("first", "second"):
+        ingest_document(ctx, text=text, source_file=str(tmp_path / corpus),
+                        corpus=corpus, title=corpus, locator=corpus)
+    calls = []
+    original = ctx.client.query_points
+
+    def query_points(**kwargs):
+        calls.append(kwargs)
+        for prefetch in kwargs.get("prefetch", []):
+            assert not hasattr(prefetch.query, "indices") or prefetch.query.indices
+        assert "prefetch" not in kwargs
+        assert kwargs["using"] == "dense"
+        return original(**kwargs)
+
+    monkeypatch.setattr(ctx.client, "query_points", query_points)
+    result = search(ctx, query, ["first", "second"])
+    assert len(calls) == 2
+    assert len(result.results) == 2
+    assert result.notices == []
+    assert result.failed == []
+    assert [hit.score for hit in result.results] == [1 / 61, 1 / 62]
+    assert all(hit.keyword_coverage == 0 for hit in result.results)
 
 
 def test_partial_keyword_match_gets_no_keyword_rank(ctx, tmp_path):

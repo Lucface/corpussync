@@ -80,8 +80,19 @@ def test_markdown_txt_html_vtt_and_srt_fixtures(tmp_path):
     assert srt == clean_srt((FIXTURES / "sample.srt").read_text(encoding="utf-8"))
 
 
+def test_markdown_bom_keeps_first_heading(tmp_path):
+    """source: round 5 item 6, a UTF-8 byte order mark cannot hide a Markdown heading."""
+    path = tmp_path / "fallback.md"
+    path.write_bytes(b"\xef\xbb\xbf# Heading title\n\nBody with invalid byte: \xff\n")
+    text, title = extract_file(path)
+    assert title == "Heading title"
+    assert text == "# Heading title\n\nBody with invalid byte: \ufffd\n"
+
+
 def test_pdf_and_docx_extract_when_installed(tmp_path):
     """source: pdf and docx are extracted when the extra is installed."""
+    pytest.importorskip("pypdf")
+    pytest.importorskip("docx")
     pdf_path = tmp_path / "note.pdf"
     pdf_path.write_bytes(_PDF)
     pdf_text, pdf_title = extract_file(pdf_path)

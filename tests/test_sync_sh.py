@@ -11,6 +11,7 @@ from tests.conftest import REPO
 
 
 def _sync_env(tmp_path, channels, ids=1):
+    """source: sync stubs record option values and simulate channel failures without services."""
     home = tmp_path / "home"
     home.mkdir()
     stub_dir = tmp_path / "bin"
@@ -37,7 +38,7 @@ printf '\\n' >> "$PY_LOG"
 source=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --source) shift; source="$1" ;;
+    --source=*) source="${1#--source=}" ;;
   esac
   shift
 done
@@ -55,12 +56,12 @@ done
     return env
 
 
-@pytest.mark.parametrize("source", ["../x", "bad..name", ".hidden", "-option", "bad name", "x" * 64])
+@pytest.mark.parametrize("source", ["../x", "bad..name", ".hidden", "-option", "bad name", "x" * 57, "x" * 64])
 def test_sync_invalid_source_creates_nothing_and_continues(tmp_path, source):
-    """source: round 4 item 6, invalid sources cannot create paths and count as failed without stopping sync."""
+    """source: round 4 item 6 and round 5 item 13, invalid or overlong sources fail without stopping later channels."""
     env = _sync_env(
         tmp_path,
-        f"{source}|@x|https://example.invalid/x\n"
+        f"{source}|@YourChannel|https://example.invalid/x\n"
         "mychannel|@YourChannel|https://example.invalid/channel\n",
     )
     proc = subprocess.run(["/bin/bash", str(REPO / "sync.sh")], cwd=tmp_path,
@@ -73,8 +74,50 @@ def test_sync_invalid_source_creates_nothing_and_continues(tmp_path, source):
     ) in proc.stdout.splitlines()
     calls = [line.split("\t")[:-1] for line in (tmp_path / "py.log").read_text().splitlines()]
     assert len(calls) == 1
-    assert calls[0][calls[0].index("--source") + 1] == "mychannel"
+    assert "--source=mychannel" in calls[0]
     assert proc.stdout.splitlines()[-1] == "sync: 2 channels, 1 failed"
+
+
+@pytest.mark.parametrize("case", ["stale", "recent", "confirmed", "legacy"])
+def test_sync_no_caption_confirmation_window(tmp_path, case):
+    """source: round 5 item 8, fresh uploads retry after two days and confirmed or recent misses skip before the cap."""
+    import time
+    from pathlib import Path
+
+    env = _sync_env(tmp_path, "mychannel|@YourChannel|https://example.invalid/channel\n", ids=2)
+    data = Path(env["CORPUSSYNC_DATA"]) / "mychannel"
+    data.mkdir(parents=True)
+    now = int(time.time())
+    records = {
+        "stale": f"video0\t{now - 3 * 86400}\n",
+        "recent": f"video0\t{now - 3600}\n",
+        "confirmed": f"video0\t{now - 3 * 86400}\nvideo0\t{now - 6 * 86400}\n",
+        "legacy": "video0\n",
+    }
+    misses = data / "no-captions.txt"
+    misses.write_text(records[case])
+    proc = subprocess.run(["/bin/bash", str(REPO / "sync.sh")], cwd=tmp_path,
+                          env=env, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    pulls = [line.split("\t")[-2] for line in (tmp_path / "yt.log").read_text().splitlines()
+             if "--write-auto-subs" in line]
+    retried = case in ("stale", "legacy")
+    assert pulls == ["https://youtu.be/video0" if retried else "https://youtu.be/video1"]
+    lines = misses.read_text().splitlines()
+    assert lines[:-1] == records[case].splitlines()
+    video, timestamp = lines[-1].split("\t")
+    assert video == ("video0" if retried else "video1")
+    assert now <= int(timestamp) <= int(time.time())
+    assert not list(data.glob("no-captions-skip.*"))
+    if case == "legacy":
+        proc = subprocess.run(["/bin/bash", str(REPO / "sync.sh")], cwd=tmp_path,
+                              env=env, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        pulls = [line.split("\t")[-2] for line in (tmp_path / "yt.log").read_text().splitlines()
+                 if "--write-auto-subs" in line]
+        assert pulls == ["https://youtu.be/video0", "https://youtu.be/video1"]
+        assert [line for line in misses.read_text().splitlines() if line.split("\t")[0] == "video0"] == lines
+        assert not list(data.glob("no-captions-skip.*"))
 
 
 def test_sync_both_yt_calls_end_options_before_url(tmp_path):
@@ -89,6 +132,23 @@ def test_sync_both_yt_calls_end_options_before_url(tmp_path):
     assert len(listed) == len(pulled) == 1
     assert listed[0][-2:] == ["--", "--version"]
     assert pulled[0][-2:] == ["--", "https://youtu.be/video0"]
+
+
+def test_sync_python_values_use_equals_for_dash_handle(tmp_path):
+    """source: round 5 items 13 and 14, a maximum-length source and dash-prefixed placeholder handle reach Python safely."""
+    source = "x" * 56
+    env = _sync_env(tmp_path, f"{source}|-dash|https://example.invalid/channel\n")
+    proc = subprocess.run(["/bin/bash", str(REPO / "sync.sh")], cwd=tmp_path,
+                          env=env, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    calls = [line.split("\t")[:-1] for line in (tmp_path / "py.log").read_text().splitlines()]
+    assert len(calls) == 1
+    assert calls[0][1:] == [
+        f"--captions={tmp_path / 'data' / source / 'captions'}",
+        f"--titles={tmp_path / 'data' / source / 'video-list.tsv'}",
+        f"--source={source}", "--channel=-dash",
+    ]
+    assert proc.stdout.splitlines()[-1] == "sync: 1 channels, 0 failed"
 
 
 def test_sync_cap_accepts_toml_underscores(tmp_path):
@@ -134,7 +194,7 @@ def test_sync_channel_failure_counts_and_continues(tmp_path, failure):
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert proc.stdout.splitlines()[-1] == "sync: 2 channels, 1 failed"
     calls = [line.split("\t")[:-1] for line in (tmp_path / "py.log").read_text().splitlines()]
-    sources = [args[args.index("--source") + 1] for args in calls]
+    sources = [arg.split("=", 1)[1] for args in calls for arg in args if arg.startswith("--source=")]
     assert sources == (["second"] if failure == "list" else ["first", "second"])
     if failure == "list":
         assert "  list refresh failed" in proc.stdout.splitlines()
@@ -163,7 +223,7 @@ def test_sync_comments_only_channels_reports_no_work(tmp_path):
 
 
 def test_sync_tilde_comments_cap_and_no_caption_skip(tmp_path):
-    """source: defects 9, 20, 22 and round 3 item 5, caption-less videos skip while failed downloads retry."""
+    """source: round 5 item 8 and earlier sync defects, recent misses skip while failed downloads retry with private state."""
     home = tmp_path / "user"
     home.mkdir()
     config_home = home / ".corpussync"
@@ -224,9 +284,12 @@ fi
         assert proc.returncode == 0, proc.stdout + proc.stderr
         outputs.append(proc.stdout)
         skipped = home / "data # kept" / "mychannel" / "no-captions.txt"
-        assert "flaky" not in skipped.read_text().splitlines()
+        assert "flaky" not in [line.split("\t")[0] for line in skipped.read_text().splitlines()]
     data = home / "data # kept" / "mychannel"
-    assert (data / "no-captions.txt").read_text().splitlines() == ["empty"]
+    misses = (data / "no-captions.txt").read_text().splitlines()
+    assert len(misses) == 1
+    assert misses[0].split("\t")[0] == "empty"
+    assert misses[0].split("\t")[1].isdigit()
     assert sorted(path.name for path in (data / "captions").glob("*.vtt")) == ["first.en.vtt", "flaky.en.vtt", "second.en.vtt"]
     pulls = [line for line in yt_log.read_text().splitlines() if "--write-auto-subs" in line]
     assert len(pulls) == 5

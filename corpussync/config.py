@@ -77,7 +77,10 @@ def load_toml_file(path: Path) -> dict:
                 f"corpussync needs tomli on Python 3.9 and 3.10 to read {path}. "
                 "Run: pip install tomli"
             ) from None
-    return toml.loads(path.read_text(encoding="utf-8"))
+    try:
+        return toml.loads(path.read_text(encoding="utf-8"))
+    except toml.TOMLDecodeError as exc:
+        raise SystemExit(f"could not read {path}: {exc}") from None
 
 
 def _present(value) -> bool:
@@ -91,6 +94,16 @@ def _pick(key: str, *maps: dict, default=None):
     return default
 
 
+def _whole_number(name: str, value) -> int:
+    try:
+        number = int(value)
+        if isinstance(value, bool) or (not isinstance(value, str) and number != value):
+            raise ValueError
+        return number
+    except (TypeError, ValueError, OverflowError):
+        raise SystemExit(f"{name} must be a whole number (got: {value})") from None
+
+
 def read_env() -> dict:
     out: dict = {}
     env = os.environ
@@ -101,15 +114,15 @@ def read_env() -> dict:
     if env.get("QDRANT_HOST"):
         out["qdrant_host"] = env["QDRANT_HOST"]
     if env.get("QDRANT_PORT"):
-        out["qdrant_port"] = int(env["QDRANT_PORT"])
+        out["qdrant_port"] = _whole_number("QDRANT_PORT", env["QDRANT_PORT"])
     if env.get("OLLAMA_HOST"):
         out["ollama_host"] = env["OLLAMA_HOST"]
     if env.get("OLLAMA_PORT"):
-        out["ollama_port"] = int(env["OLLAMA_PORT"])
+        out["ollama_port"] = _whole_number("OLLAMA_PORT", env["OLLAMA_PORT"])
     if env.get("CORPUSSYNC_EMBED_MODEL"):
         out["embed_model"] = env["CORPUSSYNC_EMBED_MODEL"]
     if env.get("CORPUSSYNC_EMBED_DIM"):
-        out["embed_dim"] = int(env["CORPUSSYNC_EMBED_DIM"])
+        out["embed_dim"] = _whole_number("CORPUSSYNC_EMBED_DIM", env["CORPUSSYNC_EMBED_DIM"])
     if env.get("CORPUSSYNC_EMBEDDER"):
         out["embedder"] = env["CORPUSSYNC_EMBEDDER"]
     if env.get("CORPUSSYNC_CHAT"):
@@ -121,7 +134,7 @@ def read_env() -> dict:
     if env.get("CHANNELS_FILE"):
         out["channels_file"] = env["CHANNELS_FILE"]
     if env.get("PER_RUN_CAP"):
-        out["per_run_cap"] = int(env["PER_RUN_CAP"])
+        out["per_run_cap"] = _whole_number("PER_RUN_CAP", env["PER_RUN_CAP"])
     if env.get("PYBIN"):
         out["pybin"] = env["PYBIN"]
     if env.get("COOKIE_JAR"):
@@ -142,7 +155,7 @@ def toml_to_map(data: dict) -> dict:
     if _present(data.get("channels_file")):
         out["channels_file"] = data["channels_file"]
     if _present(data.get("per_run_cap")):
-        out["per_run_cap"] = int(data["per_run_cap"])
+        out["per_run_cap"] = _whole_number("per_run_cap", data["per_run_cap"])
     if _present(data.get("cookie_jar")):
         out["cookie_jar"] = data["cookie_jar"]
     if _present(data.get("pybin")):
@@ -154,19 +167,19 @@ def toml_to_map(data: dict) -> dict:
     if _present(qdrant.get("host")):
         out["qdrant_host"] = qdrant["host"]
     if "port" in qdrant and _present(qdrant.get("port")):
-        out["qdrant_port"] = int(qdrant["port"])
+        out["qdrant_port"] = _whole_number("qdrant.port", qdrant["port"])
 
     ollama = data.get("ollama") if isinstance(data.get("ollama"), dict) else {}
     if _present(ollama.get("host")):
         out["ollama_host"] = ollama["host"]
     if "port" in ollama and _present(ollama.get("port")):
-        out["ollama_port"] = int(ollama["port"])
+        out["ollama_port"] = _whole_number("ollama.port", ollama["port"])
 
     embed = data.get("embed") if isinstance(data.get("embed"), dict) else {}
     if _present(embed.get("model")):
         out["embed_model"] = embed["model"]
     if "dim" in embed and _present(embed.get("dim")):
-        out["embed_dim"] = int(embed["dim"])
+        out["embed_dim"] = _whole_number("embed.dim", embed["dim"])
     if _present(embed.get("backend")):
         out["embedder"] = embed["backend"]
 

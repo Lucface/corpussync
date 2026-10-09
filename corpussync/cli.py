@@ -85,9 +85,12 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+_SELECT_HINT = "pass --corpus NAME, --collection NAME or --all"
+
+
 def _corpora(ctx, args):
     if not args.search_all and not args.corpus and not args.collection:
-        print("pass --corpus NAME, --collection NAME or --all", file=sys.stderr)
+        print(_SELECT_HINT, file=sys.stderr)
         return None
     names = list(args.collection)
     if args.search_all:
@@ -140,28 +143,35 @@ def cmd_init(directory: str | None) -> int:
 
 def stats_collection(ctx, collection: str) -> int:
     try:
-        ctx.client.get_collection(collection)
+        if collection not in collection_names(ctx.client):
+            print(f"{collection}: not found")
+            return 2
         count = point_count(ctx.client, collection)
     except Exception as exc:
-        print(f"{collection}: not found ({exc})")
-        return 0
+        print(f"could not read {collection}: {str(exc)[:120]}", file=sys.stderr)
+        return 1
     print(f"{collection}: {count} points")
     return 0
 
 
 def cmd_stats(ctx, corpus: str | None, collections=None) -> int:
-    if corpus or collections:
-        names, missing = select_collections(ctx, [corpus] if corpus else [], collections)
-        for name in missing:
-            print(f"{name}: not found")
-    else:
-        names = sorted(ctx.collections)
-    if not names:
+    missing = []
+    try:
+        if corpus or collections:
+            names, missing = select_collections(ctx, [corpus] if corpus else [], collections)
+        else:
+            names = sorted(ctx.collections)
+    except Exception as exc:
+        for name in ([corpus] if corpus else []) + list(collections or []) or ["corpora"]:
+            print(f"could not read {name}: {str(exc)[:120]}", file=sys.stderr)
+        return 1
+    for name in missing:
+        print(f"{name}: not found")
+    if not names and not missing:
         print("no corpora")
         return 0
-    for name in names:
-        stats_collection(ctx, name)
-    return 0
+    statuses = [stats_collection(ctx, name) for name in names]
+    return 1 if 1 in statuses else (2 if missing or 2 in statuses else 0)
 
 
 def cmd_list(ctx) -> int:
@@ -259,12 +269,16 @@ def cmd_doctor(ctx) -> int:
 
 
 def cmd_search(ctx, args) -> int:
+    empty = {"query": args.query, "mode": args.mode, "results": [], "coverage": {}}
     selection = _corpora(ctx, args)
     if selection is None:
+        if args.json:
+            print(json.dumps({**empty, "error": _SELECT_HINT}))
         return 1
     corpora, collections = selection
     if not corpora and not collections:
-        print(no_match_message([]))
+        message = no_match_message([])
+        print(json.dumps({**empty, "message": message}) if args.json else message)
         return 2
     result = search(ctx, args.query, corpora, k=args.k, mode=args.mode,
                     min_score=args.min_score, collections=collections)
@@ -274,8 +288,11 @@ def cmd_search(ctx, args) -> int:
     if not result.results:
         if result.error is not None:
             print(f"could not search: {result.error}", file=sys.stderr)
+            if args.json:
+                print(json.dumps({**empty, "error": result.error[:120]}))
             return 1
-        print(no_match_message(corpora + collections))
+        message = no_match_message(corpora + collections)
+        print(json.dumps({**empty, "message": message}) if args.json else message)
         return 2
     if args.json:
         print(json.dumps(_result_payload(args.query, args.mode, result)))
@@ -363,6 +380,8 @@ def main_compat(argv=None, probe=None) -> int:
     args = ap.parse_args(argv)
     try:
         _validate_names(args)
+        if not args.collection:
+            check_name(f"{args.source}-corpus", "collection")
     except InvalidName as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -383,7 +402,8 @@ def main_compat(argv=None, probe=None) -> int:
             privacy_notices(ctx.settings)
         collection = args.collection or f"{args.source}-corpus"
         if args.stats:
-            return stats_collection(ctx, collection)
+            status = stats_collection(ctx, collection)
+            return 0 if status == 2 else status
         if not args.captions:
             ap.error("--captions is required unless --stats")
         ctx.collection_override = args.collection or f"{args.source}-corpus"

@@ -227,7 +227,7 @@ def test_switching_store_does_not_reuse_hashes(ctx, tmp_path):
 
 
 def test_prune_deleted_renamed_and_keep_missing(ctx, tmp_path, capsys):
-    """source: defect 4, a complete folder scan prunes absent files unless keep-missing is set."""
+    """source: defect 4 and round 5 items 9 and 12, nonempty scans prune renamed or deleted files unless kept."""
     root = tmp_path / "notes"
     root.mkdir()
     path = root / "old.txt"
@@ -240,8 +240,11 @@ def test_prune_deleted_renamed_and_keep_missing(ctx, tmp_path, capsys):
     assert len(_scroll(ctx, "notes")) == 1
     assert "removed old.txt (no longer on disk)" in capsys.readouterr().out
     (root / "new.txt").unlink()
+    (root / "remaining.txt").write_text("another supported file keeps the scan nonempty")
     assert ingest_paths(ctx, [root], "notes") == 0
-    assert _scroll(ctx, "notes") == []
+    assert {point.payload["source_file"] for point in _scroll(ctx, "notes")} == {
+        str((root / "remaining.txt").resolve()),
+    }
 
 
 def test_prune_keeps_existing_file_inside_hidden_folder(ctx, tmp_path, capsys):
@@ -268,6 +271,28 @@ def test_prune_keeps_existing_file_inside_hidden_folder(ctx, tmp_path, capsys):
     assert "DONE: 0 files, 0 chunks, 0 removed, 0 skipped, 0 failed -> notes-corpus" in output
 
 
+@pytest.mark.parametrize("unsupported", [False, True])
+def test_empty_supported_scan_keeps_indexed_files(ctx, tmp_path, capsys, unsupported):
+    """source: round 5 item 9, empty mount points and unsupported-only scans keep indexed rows and report retention."""
+    root = tmp_path / "notes"
+    root.mkdir()
+    for name in ("first.txt", "second.md"):
+        (root / name).write_text("five words make this note")
+    assert ingest_paths(ctx, [root], "notes") == 0
+    before = {point.id for point in _scroll(ctx, "notes")}
+    root.rename(tmp_path / "unmounted")
+    root.mkdir()
+    if unsupported:
+        (root / "image.png").write_bytes(b"unsupported")
+    capsys.readouterr()
+    assert ingest_paths(ctx, [root], "notes") == 0
+    assert {point.id for point in _scroll(ctx, "notes")} == before
+    assert ctx.db.execute("SELECT COUNT(*) FROM ingest_state WHERE collection='notes-corpus'").fetchone() == (2,)
+    assert (
+        f"note: {root.resolve()} has no supported files; kept 2 indexed files from it (remove the corpus to clear them)"
+    ) in capsys.readouterr().out.splitlines()
+
+
 def test_file_and_missing_root_never_prune(ctx, tmp_path):
     """source: defect 4, individual files and missing roots cannot remove a folder's state."""
     root = tmp_path / "notes"
@@ -282,6 +307,35 @@ def test_file_and_missing_root_never_prune(ctx, tmp_path):
     root.rename(tmp_path / "renamed")
     assert ingest_paths(ctx, [root], "notes") == 1
     assert len(_scroll(ctx, "notes")) == 2
+
+
+@pytest.mark.parametrize("rename_folder", [False, True])
+def test_case_only_rename_removes_old_points(ctx, tmp_path, rename_folder):
+    """source: round 5 item 12, case-only file and folder renames cannot retain duplicate points on insensitive filesystems."""
+    probe = tmp_path / "Probe"
+    probe.touch()
+    if not (tmp_path / "probe").exists():
+        pytest.skip("temporary filesystem is case-sensitive")
+    root = tmp_path / "notes"
+    path = root / "Drafts" / "Note.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("five words make this note")
+    assert ingest_paths(ctx, [root], "notes") == 0
+    old_path = str(path.resolve())
+    old_ids = {point.id for point in _scroll(ctx, "notes")}
+    if rename_folder:
+        path.parent.rename(root / "drafts")
+        renamed = root / "drafts" / "Note.md"
+    else:
+        renamed = path.with_name("note.md")
+        path.rename(renamed)
+    assert path.exists()
+    assert ingest_paths(ctx, [root], "notes") == 0
+    points = _scroll(ctx, "notes")
+    assert len(points) == 1
+    assert {point.id for point in points}.isdisjoint(old_ids)
+    assert points[0].payload["source_file"] == str(renamed.resolve())
+    assert ctx.db.execute("SELECT path FROM ingest_state WHERE path=?", (old_path,)).fetchall() == []
 
 
 def test_failed_scan_never_prunes(ctx, tmp_path, monkeypatch):
@@ -299,6 +353,25 @@ def test_failed_scan_never_prunes(ctx, tmp_path, monkeypatch):
     monkeypatch.setattr("corpussync.ingest.os.walk", failed_walk)
     assert ingest_paths(ctx, [root], "notes") == 1
     assert len(_scroll(ctx, "notes")) == 1
+
+
+@pytest.mark.parametrize("relative", [".drafts/idea.md", ".idea.md"])
+def test_nonempty_scan_keeps_existing_hidden_paths(ctx, tmp_path, relative):
+    """source: round 5 item 12, explicitly indexed hidden files survive nonempty scans but are pruned after deletion."""
+    root = tmp_path / "notes"
+    hidden = root / relative
+    hidden.parent.mkdir(parents=True)
+    hidden.write_text("five words make this note")
+    assert ingest_paths(ctx, [hidden], "notes") == 0
+    visible = root / "visible.txt"
+    visible.write_text("five words make another note")
+    assert ingest_paths(ctx, [root], "notes") == 0
+    assert {point.payload["source_file"] for point in _scroll(ctx, "notes")} == {
+        str(hidden.resolve()), str(visible.resolve()),
+    }
+    hidden.unlink()
+    assert ingest_paths(ctx, [root], "notes") == 0
+    assert {point.payload["source_file"] for point in _scroll(ctx, "notes")} == {str(visible.resolve())}
 
 
 def test_five_word_note_becomes_one_point(ctx, tmp_path):

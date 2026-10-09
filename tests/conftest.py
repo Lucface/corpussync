@@ -31,6 +31,8 @@ def isolated_env(home: Path) -> dict:
     env["CORPUSSYNC_EMBEDDER"] = "fake"
     env["CORPUSSYNC_CHAT"] = "fake"
     env["PYTHONPATH"] = str(REPO) + os.pathsep + env.get("PYTHONPATH", "")
+    # Apple's Python 3.9 links LibreSSL, so importing requests makes urllib3 warn on stderr.
+    env["PYTHONWARNINGS"] = "ignore:urllib3 v2 only supports OpenSSL"
     for key in _CLEAR:
         env.pop(key, None)
     return env

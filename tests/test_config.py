@@ -41,6 +41,20 @@ def test_missing_tomli_on_older_python_has_actionable_error(home, monkeypatch):
     )
 
 
+def test_malformed_toml_exits_cleanly(home):
+    """source: round 5 item 7, malformed TOML reports the config path without a decode traceback."""
+    path = home / "corpussync.toml"
+    path.write_text("[qdrant\nport = 6333\n")
+    with pytest.raises(SystemExit) as exc:
+        load_settings()
+    assert str(exc.value).startswith(f"could not read {path}: ")
+    proc = run_cli(["stats"], home)
+    assert proc.returncode == 1
+    assert proc.stdout == ""
+    assert proc.stderr.startswith(f"could not read {path}: ")
+    assert "Traceback" not in proc.stderr
+
+
 def test_untrusted_cwd_is_ignored(home, tmp_path):
     """source: defect 20, cwd config cannot redirect the embedder or store."""
     (tmp_path / "corpussync.toml").write_text('[ollama]\nhost="untrusted.example"\n[qdrant]\nhost="untrusted.example"\n')
@@ -51,6 +65,40 @@ def test_untrusted_cwd_is_ignored(home, tmp_path):
     assert load_settings().ollama_host == "trusted.example"
     assert load_settings().min_score == {"dense": 0.65, "keyword": 1.0}
     assert load_settings(str(tmp_path / "corpussync.toml")).ollama_host == "untrusted.example"
+
+
+@pytest.mark.parametrize("env_name,toml_key", [
+    ("QDRANT_PORT", "qdrant.port"), ("OLLAMA_PORT", "ollama.port"),
+    ("CORPUSSYNC_EMBED_DIM", "embed.dim"), ("PER_RUN_CAP", "per_run_cap"),
+])
+@pytest.mark.parametrize("origin", ["env", "toml"])
+@pytest.mark.parametrize("value", ["invalid", "1.5"])
+def test_invalid_integer_settings_exit_cleanly(home, monkeypatch, env_name, toml_key, origin, value):
+    """source: round 5 item 7, integer settings name their environment or TOML source without truncation or traceback."""
+    import subprocess
+    import sys
+    from tests.conftest import isolated_env
+
+    monkeypatch.delenv("PER_RUN_CAP", raising=False)
+    env = isolated_env(home)
+    env.pop("PER_RUN_CAP", None)
+    if origin == "env":
+        monkeypatch.setenv(env_name, value)
+        env[env_name] = value
+        name = env_name
+    else:
+        literal = '"invalid"' if value == "invalid" else value
+        (home / "corpussync.toml").write_text(f"{toml_key} = {literal}\n")
+        name = toml_key
+    expected = f"{name} must be a whole number (got: {value})"
+    with pytest.raises(SystemExit) as exc:
+        load_settings()
+    assert str(exc.value) == expected
+    proc = subprocess.run([sys.executable, "-m", "corpussync", "stats"],
+                          cwd=home, env=env, capture_output=True, text=True)
+    assert proc.returncode == 1
+    assert proc.stdout == ""
+    assert proc.stderr == expected + "\n"
 
 
 def test_init_explicit_directory_reminds_about_config(home, tmp_path):
@@ -122,6 +170,34 @@ def test_remote_privacy_notices(home, capsys):
         "note: document text goes to https://ollama.example/base (Ollama)",
         "note: document text goes to https://qdrant.example (Qdrant)",
     ]
+
+
+@pytest.mark.parametrize("system_words,user_words,expected", [
+    (0, 0, 4096), (20, 10, 4096), (1000, 1048, 4096),
+    (1000, 1049, 8192), (30, 6 * 390, 8192), (2000, 8000, 16384),
+])
+def test_chat_context_fits_all_message_words(monkeypatch, system_words, user_words, expected):
+    """source: round 5 item 3, chat reserves response space and rounds the complete prompt up to a power of two."""
+    from corpussync.answer import OllamaChat
+
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        return SimpleNamespace(raise_for_status=lambda: None,
+                               json=lambda: {"message": {"content": "answer"}})
+
+    monkeypatch.setattr("requests.post", post)
+    messages = [
+        {"role": "system", "content": "word\t" * system_words},
+        {"role": "user", "content": "word\n" * user_words},
+    ]
+    assert OllamaChat("localhost", 11434).complete("model", messages) == "answer"
+    assert len(calls) == 1
+    assert calls[0][1]["json"] == {
+        "model": "model", "messages": messages, "stream": False,
+        "options": {"num_ctx": expected},
+    }
 
 
 def test_embed_prefix_flags_and_chat_timeout(monkeypatch):

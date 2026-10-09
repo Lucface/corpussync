@@ -186,7 +186,7 @@ def ingest_paths(ctx, paths: list[Path], corpus: str, force: bool = False, keep_
     check_name(corpus, "corpus")
     ctx.begin_run()
     files = []
-    roots = []
+    roots = {}
     failed = 0
     for raw in paths:
         path = raw.expanduser()
@@ -201,6 +201,7 @@ def ingest_paths(ctx, paths: list[Path], corpus: str, force: bool = False, keep_
             files.append((path, path.parent))
             continue
         scan_errors = []
+        found = set()
         for dirpath, dirnames, filenames in os.walk(path, onerror=scan_errors.append):
             dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
             for name in sorted(filenames):
@@ -209,12 +210,13 @@ def ingest_paths(ctx, paths: list[Path], corpus: str, force: bool = False, keep_
                 file_path = Path(dirpath) / name
                 if file_path.suffix.lower() in SUPPORTED_EXTENSIONS:
                     files.append((file_path, path))
+                    found.add(str(file_path.resolve()))
         if scan_errors:
             for exc in scan_errors:
                 log(f"FAILED scan {path}: {exc}")
             failed += len(scan_errors)
         else:
-            roots.append(path.resolve())
+            roots[path.resolve()] = found
     total_files = 0
     total_chunks = 0
     skipped = 0
@@ -265,9 +267,18 @@ def ingest_paths(ctx, paths: list[Path], corpus: str, force: bool = False, keep_
         rows = ctx.db.execute(
             "SELECT path FROM ingest_state WHERE store=? AND collection=?", (identity, collection),
         ).fetchall()
+        for root, found in roots.items():
+            if not found:
+                kept = sum(source_file.startswith(str(root) + os.sep) for (source_file,) in rows)
+                if kept:
+                    print(f"note: {root} has no supported files; kept {kept} indexed files from it (remove the corpus to clear them)")
         for (source_file,) in rows:
-            root = next((root for root in roots if source_file.startswith(str(root) + os.sep)), None)
-            if root is None or os.path.exists(source_file):
+            root = next((root for root, found in roots.items()
+                         if found and source_file.startswith(str(root) + os.sep)), None)
+            if root is None or source_file in roots[root]:
+                continue
+            relative = Path(source_file).relative_to(root)
+            if any(part.startswith(".") for part in relative.parts) and os.path.exists(source_file):
                 continue
             try:
                 if collection in ctx.collections:

@@ -21,9 +21,13 @@ class OllamaChat:
         self.base = ollama_base_url(SimpleNamespace(ollama_host=host, ollama_port=port))
 
     def complete(self, model: str, messages: list[dict]) -> str:
+        words = sum(len(message["content"].split()) for message in messages)
+        needed = max(4096, (words * 3 + 1) // 2 + 1024)
+        num_ctx = 1 << (needed - 1).bit_length()
         resp = requests.post(
             f"{self.base}/api/chat",
-            json={"model": model, "messages": messages, "stream": False},
+            json={"model": model, "messages": messages, "stream": False,
+                  "options": {"num_ctx": num_ctx}},
             timeout=300,
         )
         resp.raise_for_status()
@@ -81,7 +85,7 @@ def ask(ctx, question: str, corpora: list[str], k: int = 6, model: str | None = 
     try:
         text = ctx.chat.complete(chosen, messages)
     except Exception as exc:
-        print(f"chat failed: {exc}")
+        print(f"chat failed: {exc}", file=sys.stderr)
         return 1
     print(text)
     print()

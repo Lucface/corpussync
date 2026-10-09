@@ -93,3 +93,14 @@ def test_setup_metadata_and_legacy_editable_entry():
         "pdf": ["pypdf>=4"], "docx": ["python-docx>=1.1"], "dev": ["pytest>=8", "setuptools>=61"],
     }
     assert (REPO / "setup.py").read_text() == "from setuptools import setup\nsetup()\n"
+
+
+def test_requirements_match_packaged_runtime_dependencies():
+    """source: round 5 item 15, requirements installs need the same TOML dependency as the package."""
+    import configparser
+
+    config = configparser.ConfigParser()
+    config.read(REPO / "setup.cfg")
+    assert (REPO / "requirements.txt").read_text().splitlines() == [
+        line.strip() for line in config["options"]["install_requires"].strip().splitlines()
+    ]

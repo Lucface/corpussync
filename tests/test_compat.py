@@ -55,6 +55,19 @@ def test_compat_flags_parse_and_stats_runs(tmp_path):
     assert "Traceback" not in stats.stdout
 
 
+def test_compat_overlong_default_collection_exits_without_traceback(tmp_path):
+    """source: round 5 item 13, a valid source whose suffixed collection is too long must exit two cleanly."""
+    proc = subprocess.run(
+        [sys.executable, str(REPO / "corpussync.py"), "--source", "x" * 60, "--stats"],
+        cwd=tmp_path, env=isolated_env(tmp_path / "home"), capture_output=True, text=True,
+    )
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert "collection" in proc.stderr
+    assert "x" * 60 + "-corpus" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
 def test_sync_sh_parses_on_bash_without_mapfile():
     """source: sync.sh must parse on system bash and avoid features missing from bash 3.2."""
     text = (REPO / "sync.sh").read_text(encoding="utf-8")
