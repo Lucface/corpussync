@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 from types import SimpleNamespace
 
@@ -16,14 +17,27 @@ _SYSTEM = (
 )
 
 
+def context_size(messages: list[dict]) -> int:
+    """Context tokens to request: the prompt estimate plus 1024 to answer, at least 4096, as a power of two.
+
+    The estimate is the larger of 1.5 tokens per word and a character count (four ASCII characters
+    or two thirds of one other character per token), so text without spaces, such as Chinese,
+    Japanese or code, is not undercounted.
+    """
+    text = "".join(message["content"] for message in messages)
+    words = sum(len(message["content"].split()) for message in messages)
+    ascii_chars = sum(1 for ch in text if ord(ch) < 128)
+    estimate = max(words * 1.5, ascii_chars / 4 + (len(text) - ascii_chars) * 1.5)
+    needed = max(4096, math.ceil(estimate) + 1024)
+    return 1 << (needed - 1).bit_length()
+
+
 class OllamaChat:
     def __init__(self, host: str, port: int):
         self.base = ollama_base_url(SimpleNamespace(ollama_host=host, ollama_port=port))
 
     def complete(self, model: str, messages: list[dict]) -> str:
-        words = sum(len(message["content"].split()) for message in messages)
-        needed = max(4096, (words * 3 + 1) // 2 + 1024)
-        num_ctx = 1 << (needed - 1).bit_length()
+        num_ctx = context_size(messages)
         resp = requests.post(
             f"{self.base}/api/chat",
             json={"model": model, "messages": messages, "stream": False,

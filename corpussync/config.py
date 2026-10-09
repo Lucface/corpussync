@@ -79,7 +79,7 @@ def load_toml_file(path: Path) -> dict:
             ) from None
     try:
         return toml.loads(path.read_text(encoding="utf-8"))
-    except toml.TOMLDecodeError as exc:
+    except (toml.TOMLDecodeError, UnicodeDecodeError, OSError) as exc:
         raise SystemExit(f"could not read {path}: {exc}") from None
 
 

@@ -55,6 +55,15 @@ def test_malformed_toml_exits_cleanly(home):
     assert "Traceback" not in proc.stderr
 
 
+def test_config_that_is_not_utf8_exits_cleanly(home):
+    """source: round 5 gate, a config file that is not UTF-8 raised a decode traceback instead of naming the file."""
+    path = home / "corpussync.toml"
+    path.write_bytes(b"answer_model = \"caf\xe9\"\n")
+    with pytest.raises(SystemExit) as exc:
+        load_settings()
+    assert str(exc.value).startswith(f"could not read {path}: ")
+
+
 def test_untrusted_cwd_is_ignored(home, tmp_path):
     """source: defect 20, cwd config cannot redirect the embedder or store."""
     (tmp_path / "corpussync.toml").write_text('[ollama]\nhost="untrusted.example"\n[qdrant]\nhost="untrusted.example"\n')
@@ -198,6 +207,18 @@ def test_chat_context_fits_all_message_words(monkeypatch, system_words, user_wor
         "model": "model", "messages": messages, "stream": False,
         "options": {"num_ctx": expected},
     }
+
+
+@pytest.mark.parametrize("text,expected", [
+    (chr(0x6587) * 3000, 8192),
+    (chr(0x6587) * 1000, 4096),
+    ("x" * 40000, 16384),
+])
+def test_chat_context_counts_text_without_spaces(text, expected):
+    """source: round 5 gate, a word count alone undercounts Chinese, Japanese or code, and Ollama then truncates the prompt."""
+    from corpussync.answer import context_size
+
+    assert context_size([{"role": "user", "content": text}]) == expected
 
 
 def test_embed_prefix_flags_and_chat_timeout(monkeypatch):
