@@ -212,10 +212,12 @@ def test_chat_context_fits_all_message_words(monkeypatch, system_words, user_wor
 @pytest.mark.parametrize("text,expected", [
     (chr(0x6587) * 3000, 8192),
     (chr(0x6587) * 1000, 4096),
+    (chr(0x0E01) * 3000, 8192),
     ("x" * 40000, 16384),
+    ((chr(0x0441) + chr(0x043B) + chr(0x043E) + chr(0x0432) + chr(0x043E) + " ") * 2340, 8192),
 ])
 def test_chat_context_counts_text_without_spaces(text, expected):
-    """source: round 5 gate, a word count alone undercounts Chinese, Japanese or code, and Ollama then truncates the prompt."""
+    """source: round 5 gate, a word count alone undercounts Chinese, Japanese, Thai or code, and Ollama then truncates the prompt; a per-character count must not inflate spaced scripts such as Russian."""
     from corpussync.answer import context_size
 
     assert context_size([{"role": "user", "content": text}]) == expected

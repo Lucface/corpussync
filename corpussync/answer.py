@@ -17,17 +17,33 @@ _SYSTEM = (
 )
 
 
+# Scripts written without spaces between words: Thai, Lao, Myanmar, Khmer, kana, CJK ideographs,
+# Hangul syllables, compatibility ideographs, full-width forms, and the supplementary ideographs.
+_UNSPACED = (
+    (0x0E00, 0x0EFF), (0x1000, 0x109F), (0x1780, 0x17FF), (0x3040, 0x30FF), (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF), (0xAC00, 0xD7AF), (0xF900, 0xFAFF), (0xFF00, 0xFFEF), (0x20000, 0x2FFFF),
+)
+
+
+def _char_tokens(ch: str) -> float:
+    code = ord(ch)
+    if code < 128:
+        return 0.25
+    if any(low <= code <= high for low, high in _UNSPACED):
+        return 1.5
+    return 1 / 3
+
+
 def context_size(messages: list[dict]) -> int:
     """Context tokens to request: the prompt estimate plus 1024 to answer, at least 4096, as a power of two.
 
-    The estimate is the larger of 1.5 tokens per word and a character count (four ASCII characters
-    or two thirds of one other character per token), so text without spaces, such as Chinese,
-    Japanese or code, is not undercounted.
+    The estimate is the larger of 1.5 tokens per word and a character count. The character count
+    covers scripts written without spaces, such as Chinese, Japanese or Thai, and long runs of code,
+    without inflating spaced scripts such as Russian or Greek.
     """
     text = "".join(message["content"] for message in messages)
     words = sum(len(message["content"].split()) for message in messages)
-    ascii_chars = sum(1 for ch in text if ord(ch) < 128)
-    estimate = max(words * 1.5, ascii_chars / 4 + (len(text) - ascii_chars) * 1.5)
+    estimate = max(words * 1.5, sum(_char_tokens(ch) for ch in text))
     needed = max(4096, math.ceil(estimate) + 1024)
     return 1 << (needed - 1).bit_length()
 
