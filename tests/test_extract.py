@@ -1,0 +1,178 @@
+"""source: extract reads notes and captions, and skips pdf or docx when the extra is missing."""
+
+from __future__ import annotations
+
+import builtins
+import sys
+from pathlib import Path
+
+import pytest
+
+from corpussync.extract import extract_file
+from corpussync.vtt import clean_srt, clean_vtt
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+_PDF = b"""%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]
+/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 73 >>
+stream
+BT
+/F1 12 Tf
+72 720 Td
+(Hello from the pdf fixture.) Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000266 00000 n 
+0000000390 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+467
+%%EOF
+"""
+
+
+def test_markdown_txt_html_vtt_and_srt_fixtures(tmp_path):
+    """source: md, txt, html, vtt, and srt extract to text, with a heading title when one exists."""
+    md_text, md_title = extract_file(FIXTURES / "sample.md")
+    assert md_title == "Markdown Title"
+    assert "linen cloth" in md_text
+
+    copy = tmp_path / "sample.markdown"
+    copy.write_text((FIXTURES / "sample.md").read_text(encoding="utf-8"), encoding="utf-8")
+    _text, title = extract_file(copy)
+    assert title == "Markdown Title"
+
+    txt, txt_title = extract_file(FIXTURES / "sample.txt")
+    assert txt_title is None
+    assert "Plain text notes" in txt
+
+    html, html_title = extract_file(FIXTURES / "sample.html")
+    assert html_title == "HTML Title"
+    assert "Hello from html." in html
+    assert "secret script" not in html
+    assert "Page Title" not in html
+
+    vtt, _title = extract_file(FIXTURES / "rolling.vtt")
+    assert vtt == clean_vtt((FIXTURES / "rolling.vtt").read_text(encoding="utf-8"))
+    srt, _title = extract_file(FIXTURES / "sample.srt")
+    assert srt == clean_srt((FIXTURES / "sample.srt").read_text(encoding="utf-8"))
+
+
+def test_markdown_bom_keeps_first_heading(tmp_path):
+    """source: round 5 item 6, a UTF-8 byte order mark cannot hide a Markdown heading."""
+    path = tmp_path / "fallback.md"
+    path.write_bytes(b"\xef\xbb\xbf# Heading title\n\nBody with invalid byte: \xff\n")
+    text, title = extract_file(path)
+    assert title == "Heading title"
+    assert text == "# Heading title\n\nBody with invalid byte: \ufffd\n"
+
+
+def test_pdf_and_docx_extract_when_installed(tmp_path):
+    """source: pdf and docx are extracted when the extra is installed."""
+    pytest.importorskip("pypdf")
+    pytest.importorskip("docx")
+    pdf_path = tmp_path / "note.pdf"
+    pdf_path.write_bytes(_PDF)
+    pdf_text, pdf_title = extract_file(pdf_path)
+    assert pdf_title is None
+    assert "Hello from the pdf fixture." in pdf_text
+
+    from docx import Document
+
+    docx_path = tmp_path / "note.docx"
+    document = Document()
+    document.add_heading("Doc Title", level=1)
+    document.add_paragraph("Hello from docx body")
+    document.save(docx_path)
+    docx_text, docx_title = extract_file(docx_path)
+    assert docx_title == "Doc Title"
+    assert "Hello from docx body" in docx_text
+
+
+def _block_import(monkeypatch, root_name):
+    real = builtins.__import__
+    for key in list(sys.modules):
+        if key == root_name or key.startswith(root_name + "."):
+            monkeypatch.delitem(sys.modules, key, raising=False)
+
+    def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == root_name or name.startswith(root_name + "."):
+            raise ImportError(f"{root_name} is not installed")
+        return real(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+
+
+def test_pdf_skipped_when_extra_missing(tmp_path, monkeypatch, capsys):
+    """source: round 3 item 4, a missing pdf extra raises a dedicated skip with one diagnostic."""
+    from corpussync.extract import MissingExtra
+
+    _block_import(monkeypatch, "pypdf")
+    path = tmp_path / "note.pdf"
+    path.write_bytes(b"%PDF-1.4\n")
+    with pytest.raises(MissingExtra):
+        extract_file(path)
+    captured = capsys.readouterr()
+    assert "[pdf]" in captured.out
+    assert "Traceback" not in captured.err
+
+
+def test_docx_skipped_when_extra_missing(tmp_path, monkeypatch, capsys):
+    """source: round 3 item 4, a missing docx extra raises a dedicated skip with one diagnostic."""
+    from corpussync.extract import MissingExtra
+
+    _block_import(monkeypatch, "docx")
+    path = tmp_path / "note.docx"
+    path.write_bytes(b"not a document")
+    with pytest.raises(MissingExtra):
+        extract_file(path)
+    captured = capsys.readouterr()
+    assert "[docx]" in captured.out
+    assert "Traceback" not in captured.err
+
+
+def test_docx_tables_keep_document_order(tmp_path):
+    """source: defect 11, DOCX tables, nested cells and headings survive in document order."""
+    import pytest
+
+    docx = pytest.importorskip("docx")
+    doc = docx.Document()
+    doc.add_paragraph("Before")
+    table = doc.add_table(rows=1, cols=2)
+    table.cell(0, 0).text = "Left"
+    nested = table.cell(0, 0).add_table(rows=1, cols=1)
+    nested.cell(0, 0).text = "Nested"
+    table.cell(0, 1).text = "Right"
+    doc.add_heading("First heading", level=1)
+    doc.add_paragraph("After")
+    path = tmp_path / "tables.docx"
+    doc.save(path)
+    text, title = extract_file(path)
+    assert text.splitlines() == ["Before", "Left", "Nested", "Right", "First heading", "After"]
+    assert title == "First heading"
+    only = docx.Document()
+    only.add_table(rows=1, cols=1).cell(0, 0).text = "Table only"
+    only.save(path)
+    assert extract_file(path) == ("Table only", None)
