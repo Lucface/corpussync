@@ -159,8 +159,9 @@ def test_explicit_server_wins_without_probe(home, monkeypatch):
     assert calls == []
 
 
-def test_private_permissions_are_tightened(ctx, tmp_path):
-    """source: defect 5, existing corpussync directories tighten and state files are private."""
+@pytest.mark.parametrize("db_first", [False, True])
+def test_custom_home_permissions_are_preserved(ctx, tmp_path, capsys, db_first):
+    """source: round 3 item 1, an existing custom home stays shared while owned data stays private."""
     home = ctx.settings.home
     home.chmod(0o755)
     store = home / "qdrant"
@@ -168,12 +169,50 @@ def test_private_permissions_are_tightened(ctx, tmp_path):
     store.chmod(0o755)
     parent = tmp_path / "separate" / "state"
     ctx.settings.state_path = parent / "state.db"
+    if db_first:
+        ctx.db
     ctx.client
     ctx.db
-    assert home.stat().st_mode & 0o777 == 0o700
+    assert home.stat().st_mode & 0o777 == 0o755
     assert store.stat().st_mode & 0o777 == 0o700
     assert parent.stat().st_mode & 0o777 == 0o700
     assert ctx.settings.state_path.stat().st_mode & 0o777 == 0o600
+    assert capsys.readouterr().err.splitlines() == [
+        f"note: {home} is readable by other users; corpussync keeps its own files inside it private",
+    ]
+
+
+@pytest.mark.parametrize("alias", [False, True])
+def test_default_home_permissions_are_tightened(ctx, tmp_path, monkeypatch, capsys, alias):
+    """source: round 3 item 1, the default home tightens even when selected through a symlink."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    default = tmp_path / ".corpussync"
+    default.mkdir()
+    default.chmod(0o755)
+    chosen = default
+    if alias:
+        chosen = tmp_path / "alias"
+        chosen.symlink_to(default, target_is_directory=True)
+    ctx.settings.home = chosen
+    ctx.settings.state_path = chosen / "state.db"
+    ctx.client
+    ctx.db
+    assert default.stat().st_mode & 0o777 == 0o700
+    assert (default / "qdrant").stat().st_mode & 0o777 == 0o700
+    assert ctx.settings.state_path.stat().st_mode & 0o777 == 0o600
+    assert capsys.readouterr().err == ""
+
+
+def test_new_custom_home_is_private(ctx, tmp_path, capsys):
+    """source: round 3 item 1, a new custom home and its store are created private without a warning."""
+    ctx.settings.home = tmp_path / "new-home"
+    ctx.settings.state_path = ctx.settings.home / "state.db"
+    ctx.client
+    ctx.db
+    assert ctx.settings.home.stat().st_mode & 0o777 == 0o700
+    assert (ctx.settings.home / "qdrant").stat().st_mode & 0o777 == 0o700
+    assert ctx.settings.state_path.stat().st_mode & 0o777 == 0o600
+    assert capsys.readouterr().err == ""
 
 
 def test_busy_embedded_store_has_actionable_error(ctx, capsys):

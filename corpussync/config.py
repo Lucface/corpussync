@@ -405,7 +405,7 @@ class Context:
         if self._db is None:
             from corpussync.state import connect, import_legacy_state
 
-            private_directory(self.settings.home, tighten=True)
+            private_home(self.settings.home)
             self._db = connect(self.settings.state_path)
             import_legacy_state(self._db, self.settings)
         return self._db
@@ -440,6 +440,16 @@ def private_directory(path: Path, tighten: bool = False) -> None:
         path.chmod(0o700)
 
 
+def private_home(path: Path, warn: bool = False) -> None:
+    """Preserve existing custom home permissions; tighten only the default home."""
+    private_directory(path, tighten=path.resolve() == Path(DEFAULT_HOME).expanduser().resolve())
+    if warn and path.stat().st_mode & 0o077:
+        print(
+            f"note: {path} is readable by other users; corpussync keeps its own files inside it private",
+            file=sys.stderr,
+        )
+
+
 def ollama_base_url(settings) -> str:
     host = settings.ollama_host.rstrip("/")
     if "://" in host:
@@ -454,7 +464,8 @@ def is_local_host(host: str) -> bool:
     if host.startswith(("/", "~", "./", "../", "file:")):
         return True
     try:
-        return ipaddress.ip_address(host).is_loopback
+        address = ipaddress.ip_address(host)
+        return address.is_loopback or address.is_unspecified
     except ValueError:
         pass
     parsed = urlsplit(host if "://" in host else "//" + host)
@@ -462,7 +473,8 @@ def is_local_host(host: str) -> bool:
     if name.lower() == "localhost":
         return True
     try:
-        return ipaddress.ip_address(name).is_loopback
+        address = ipaddress.ip_address(name)
+        return address.is_loopback or address.is_unspecified
     except ValueError:
         return False
 

@@ -13,7 +13,7 @@ from pathlib import Path
 import requests
 
 from corpussync.answer import ask
-from corpussync.config import DEFAULT_HOME, config_template, load_context, ollama_base_url, private_directory, privacy_notices
+from corpussync.config import DEFAULT_HOME, config_template, load_context, ollama_base_url, private_home, privacy_notices
 from corpussync.names import InvalidName, check_name
 from corpussync.ingest import ingest_paths, ingest_youtube
 from corpussync.search import no_match_message, print_coverage, print_hits, print_notices, search, select_collections
@@ -75,7 +75,7 @@ def _parser() -> argparse.ArgumentParser:
     selection.add_argument("--collection")
     remove.add_argument("--yes", action="store_true")
 
-    doctor = sub.add_parser("doctor", help="check Ollama, the embed model, the store, and yt-dlp")
+    doctor = sub.add_parser("doctor", help="check Ollama, the embed and answer models, the store, and yt-dlp")
     for child in (init, ingest, youtube, find, question, stats, listed, remove, doctor):
         child.add_argument("--config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     return parser
@@ -122,7 +122,7 @@ def _result_payload(query: str, mode: str, result) -> dict:
 def cmd_init(directory: str | None) -> int:
     home = Path(os.environ.get("CORPUSSYNC_HOME", DEFAULT_HOME)).expanduser()
     folder = Path(directory).expanduser() if directory else home
-    private_directory(folder, tighten=folder.resolve() == home.resolve())
+    private_home(folder)
     if folder.resolve() != home.resolve():
         print("a file outside CORPUSSYNC_HOME is read only through --config")
     target = folder / "corpussync.toml"
@@ -218,6 +218,12 @@ def cmd_doctor(ctx) -> int:
         else:
             failed = True
             print(f"embed model {want} is not pulled. Fix: ollama pull {want}")
+        want = settings.answer_model
+        pulled = any(name == want or name.split(":")[0] == want for name in names)
+        if pulled:
+            print(f"answer model {want}: ok")
+        else:
+            print(f"warning: answer model {want} is not pulled (only ask needs it). Fix: ollama pull {want}")
     except Exception as exc:
         failed = True
         print(f"Ollama did not answer at {base}. Fix: start Ollama (ollama serve). ({exc})")
@@ -262,6 +268,9 @@ def cmd_search(ctx, args) -> int:
     for corpus in result.missing:
         print(f"{corpus}: not found", file=sys.stderr)
     if not result.results:
+        if result.error is not None:
+            print(f"could not search: {result.error}", file=sys.stderr)
+            return 1
         print(no_match_message(corpora + collections))
         return 2
     if args.json:

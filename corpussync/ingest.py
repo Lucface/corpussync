@@ -9,7 +9,7 @@ from pathlib import Path
 from qdrant_client.models import FieldCondition, Filter, MatchValue, PointStruct, Range
 
 from corpussync.chunking import chunk
-from corpussync.extract import SUPPORTED_EXTENSIONS, extract_file
+from corpussync.extract import MissingExtra, SUPPORTED_EXTENSIONS, extract_file
 from corpussync.names import check_name
 from corpussync.sparse import sparse_vector
 from corpussync.state import content_hash, save_hash, saved_hash, delete_collection_rows, store_identity
@@ -216,9 +216,13 @@ def ingest_paths(ctx, paths: list[Path], corpus: str, force: bool = False, keep_
             roots.append(path.resolve())
     total_files = 0
     total_chunks = 0
+    skipped = 0
     for file_path, root in files:
         try:
             extracted = extract_file(file_path)
+        except MissingExtra:
+            skipped += 1
+            continue
         except Exception as exc:
             log(f"FAILED {file_path.name}: {exc}")
             failed += 1
@@ -279,7 +283,7 @@ def ingest_paths(ctx, paths: list[Path], corpus: str, force: bool = False, keep_
             except Exception as exc:
                 failed += 1
                 log(f"FAILED removing {source_file}: {exc}")
-    log(f"DONE: {total_files} files, {total_chunks} chunks, {removed} removed, {failed} failed -> {collection}")
+    log(f"DONE: {total_files} files, {total_chunks} chunks, {removed} removed, {skipped} skipped, {failed} failed -> {collection}")
     return 1 if failed else 0
 
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 import subprocess
 import sys
 
+import pytest
+
 from qdrant_client.models import Distance, VectorParams
 
 from corpussync.answer import ask
@@ -362,6 +364,85 @@ def test_failed_embedding_is_attempted_once_per_style(ctx, tmp_path, monkeypatch
     assert result.results == []
     assert len(result.notices) == 2
     assert calls == [True]
+
+
+@pytest.mark.parametrize("command,mode", [("search", "hybrid"), ("search", "dense"), ("ask", "hybrid")])
+@pytest.mark.parametrize("failure", ["embedder", "query"])
+def test_all_search_failures_exit_one(ctx, tmp_path, monkeypatch, capsys, command, mode, failure):
+    """source: round 3 item 3, failed embedding or queries are could-not outcomes and never call chat."""
+    from corpussync.cli import _parser, cmd_ask, cmd_search
+
+    for collection in ("notes", "notes-corpus"):
+        ctx.collection_override = collection
+        ingest_document(ctx, text="five words make this note", source_file=str(tmp_path / collection),
+                        corpus="notes", title=collection, locator=collection)
+    ctx.collection_override = None
+    error = "service unavailable " + "x" * 160
+
+    def fail(*args, **kwargs):
+        if kwargs.get("collection_name") == "notes-corpus":
+            raise ValueError("second error")
+        raise ValueError(error)
+
+    if failure == "embedder":
+        monkeypatch.setattr(ctx.embedder, "embed_query", fail)
+    else:
+        monkeypatch.setattr(ctx.client, "query_points", fail)
+    result = search(ctx, "five words", [], mode=mode, collections=["notes", "notes-corpus"])
+    assert result.results == []
+    assert result.failed == ["notes", "notes-corpus"]
+    args = [command, "five words", "--collection", "notes", "--collection", "notes-corpus"]
+    if command == "search":
+        args.extend(["--mode", mode])
+    ctx.chat = _BoomChat()
+    capsys.readouterr()
+    handler = cmd_search if command == "search" else cmd_ask
+    assert handler(ctx, _parser().parse_args(args)) == 1
+    output = capsys.readouterr()
+    assert output.err.splitlines()[-1] == "could not search: " + error[:120]
+    assert "no good match" not in output.out + output.err
+    assert ctx.chat.calls == 0
+
+
+@pytest.mark.parametrize("command", ["search", "ask"])
+def test_successful_empty_collection_preserves_no_match(ctx, tmp_path, monkeypatch, capsys, command):
+    """source: round 3 item 3, one successful empty query keeps exit 2 when another collection fails."""
+    from types import SimpleNamespace
+    from corpussync.cli import _parser, cmd_ask, cmd_search
+
+    for corpus in ("bad", "empty"):
+        ingest_document(ctx, text="five words make this note", source_file=str(tmp_path / corpus),
+                        corpus=corpus, title=corpus, locator=corpus)
+
+    def query(**kwargs):
+        if kwargs["collection_name"] == "bad-corpus":
+            raise ValueError("query failed")
+        return SimpleNamespace(points=[])
+
+    monkeypatch.setattr(ctx.client, "query_points", query)
+    result = search(ctx, "five words", ["bad", "empty"])
+    assert result.results == []
+    assert result.failed == ["bad-corpus"]
+    ctx.chat = _BoomChat()
+    capsys.readouterr()
+    handler = cmd_search if command == "search" else cmd_ask
+    args = _parser().parse_args([command, "five words", "--corpus", "bad", "--corpus", "empty"])
+    assert handler(ctx, args) == 2
+    output = capsys.readouterr()
+    assert output.out == "no good match in: bad, empty\n"
+    assert "could not search" not in output.err
+    assert ctx.chat.calls == 0
+
+
+@pytest.mark.parametrize("foreign", [False, True])
+def test_incompatible_collections_are_not_failed(ctx, foreign):
+    """source: round 3 item 3, foreign layouts and keyword-incompatible collections are ordinary skips."""
+    size = 3 if foreign else ctx.settings.embed_dim
+    ctx.client.create_collection("old-corpus", vectors_config=VectorParams(size=size, distance=Distance.COSINE))
+    result = search(ctx, "five words", ["old"], mode="keyword")
+    assert result.results == []
+    assert result.failed == []
+    assert len(result.notices) == 1
 
 
 def test_foreign_name_from_all_is_not_treated_as_cli_input(ctx, monkeypatch, capsys):

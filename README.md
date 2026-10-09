@@ -44,11 +44,11 @@ python3 corpussync.py --source mychannel --stats
 
 `COOKIE_JAR` is a yt-dlp cookies file exported from your own account, for when YouTube limits requests without one.
 
-Videos without captions are recorded in `$CORPUSSYNC_DATA/<source>/no-captions.txt` and skipped before the per-run cap; delete no-captions.txt to retry those videos.
+Videos without captions are recorded in `$CORPUSSYNC_DATA/<source>/no-captions.txt` only after a successful yt-dlp call and skipped before the per-run cap; delete no-captions.txt to retry those videos. Failed downloads are retried on the next run.
 
 ## Ingesting folders
 
-`corpussync ingest ./notes --corpus notes` scans supported, non-hidden files. Short notes become one chunk. After a complete directory scan, deleted and renamed files are removed from that corpus. Pass `--keep-missing` to keep their old points. A file argument or a missing directory never prunes. A missing path or any extraction or write failure exits 1, and the final line reports files, chunks, removals and failures.
+`corpussync ingest ./notes --corpus notes` scans supported, non-hidden files. Short notes become one chunk. After a complete directory scan, deleted and renamed files are removed from that corpus. Pass `--keep-missing` to keep their old points. A file argument or a missing directory never prunes. A missing path or any extraction or write failure exits 1. Files missing the optional PDF or DOCX extra count as skipped, preserve their existing points and do not cause a failure exit. The final line reports files, chunks, removals, skips and failures.
 
 State is scoped to the store, collection and file path. The same file can be ingested into several corpora or stores. Recreating a deleted collection clears its old skip state before rebuilding it.
 
@@ -72,13 +72,13 @@ Names have 1 to 63 letters, digits, dots, dashes or underscores, start with a le
 
 ## Ask
 
-`corpussync ask "your question" --corpus notes` runs a search, then asks a local Ollama chat model to answer only from the numbered sources and to cite them as `[n]`. The model is `answer_model` (default `llama3.2`). Pass `--model NAME` to override it for one question. If nothing clears the relevance floor, ask prints the refusal and exits 2 without calling the model.
+`corpussync ask "your question" --corpus notes` runs a search, then asks a local Ollama chat model to answer only from the numbered sources and to cite them as `[n]`. The model is `answer_model` (default `llama3.2`). Pass `--model NAME` to override it for one question. If nothing clears the relevance floor, ask prints the refusal and exits 2 without calling the model. If every selected collection fails to query or embed, ask prints `could not search: <error>` to stderr and exits 1 without calling the model.
 
 ## Coding agents
 
-`corpussync search "your question" --corpus notes --json` prints one JSON object. The process exits 0 when at least one result clears the relevance floor. It exits 2 when none does, and prints `no good match in: <corpora>`.
+`corpussync search "your question" --corpus notes --json` prints one JSON object. The process exits 0 when at least one result clears the relevance floor. It exits 2 when none does, and prints `no good match in: <corpora>`. If every selected collection fails to query or embed, it prints `could not search: <error>` to stderr and exits 1.
 
-`corpussync stats --corpus notes` prints a point count. `corpussync list` prints each corpus with its point count and layout. `corpussync doctor` checks that Ollama answers, that the embed model is pulled, that the store opens, and whether `yt-dlp` is on `PATH` (a warning only).
+`corpussync stats --corpus notes` prints a point count. `corpussync list` prints each corpus with its point count and layout. `corpussync doctor` checks that Ollama answers, that the embed model is pulled, that the store opens, whether the answer model is pulled and whether `yt-dlp` is on `PATH`. A missing answer model or `yt-dlp` produces a warning without changing the exit code; only ask needs the answer model.
 
 ## Configuration
 
@@ -114,9 +114,9 @@ Nothing runs in the background. Ctrl-C stops a sync. Remove one corpus with `cor
 
 ## What leaves your machine
 
-Only yt-dlp's requests to YouTube when you sync a channel, unless you point Ollama or Qdrant at another machine, which corpussync then names on every run.
+Only yt-dlp's requests to YouTube when you sync a channel, unless you point Ollama or Qdrant at another machine, which corpussync then names on every run. Loopback and unspecified addresses (`0.0.0.0` and `::`) count as local.
 
-CorpusSync creates its home and embedded store with owner-only directory permissions (`0700`) and tightens existing home and store directories. A new state directory is also private and the database file uses `0600`. `sync.sh` creates private files and directories with `umask 077`.
+CorpusSync creates its home and embedded store with owner-only directory permissions (`0700`). It tightens an existing default home (`~/.corpussync`) and always tightens its `qdrant` directory. An existing custom `CORPUSSYNC_HOME` keeps its permissions; a note warns if it has group or other permission bits. A new state directory is also private and the database file uses `0600`. `sync.sh` creates private files and directories with `umask 077`.
 
 ## Upgrading from 0.1
 
@@ -136,7 +136,7 @@ Point ids are `uuid5(NAMESPACE_URL, "{source_file}::{index}")`. Re-ingest overwr
 
 ## Python API
 
-`corpussync.vtt.clean_vtt(raw)` and `corpussync.vtt.clean_srt(raw)` return prose. `corpussync.chunking.chunk(text, max_tokens=512, overlap=64)` returns windows. `corpussync.ingest.ingest_document(ctx, *, text, source_file, corpus, title, locator, extra_payload=None, force=False, digest=None)` returns the number of chunks written, or 0 when the content hash is unchanged. `corpussync.search.search(ctx, query, corpora, k=8, mode="hybrid", min_score=None, collections=None)` returns a `SearchResult` with `.results`, `.coverage`, `.notices` and `.missing`.
+`corpussync.vtt.clean_vtt(raw)` and `corpussync.vtt.clean_srt(raw)` return prose. `corpussync.chunking.chunk(text, max_tokens=512, overlap=64)` returns windows. `corpussync.ingest.ingest_document(ctx, *, text, source_file, corpus, title, locator, extra_payload=None, force=False, digest=None)` returns the number of chunks written, or 0 when the content hash is unchanged. `corpussync.search.search(ctx, query, corpora, k=8, mode="hybrid", min_score=None, collections=None)` returns a `SearchResult` with `.results`, `.coverage`, `.notices`, `.missing` and `.failed` (collection names with query or embedder errors). `.error` holds the first error, limited to 120 characters, when every selected collection failed; otherwise it is `None`.
 
 ## License
 

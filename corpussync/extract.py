@@ -23,8 +23,13 @@ SUPPORTED_EXTENSIONS = {
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$")
 
 
+class MissingExtra(ImportError):
+    """An optional extractor is not installed, so its files should be skipped."""
+
+
 def _missing_extra(path: Path, extra: str) -> None:
     print(f'skip {path}: install the {extra} extra (pip install "corpussync[{extra}]")')
+    raise MissingExtra(extra) from None
 
 
 def _read_text(path: Path) -> str:
@@ -82,12 +87,11 @@ def _html_text(raw: str) -> tuple[str, str | None]:
     return text, parser.title
 
 
-def _pdf_text(path: Path) -> tuple[str, str | None] | None:
+def _pdf_text(path: Path) -> tuple[str, str | None]:
     try:
         from pypdf import PdfReader
     except ImportError:
         _missing_extra(path, "pdf")
-        return None
     reader = PdfReader(str(path))
     parts = []
     for page in reader.pages:
@@ -95,13 +99,12 @@ def _pdf_text(path: Path) -> tuple[str, str | None] | None:
     return "\n".join(parts).strip(), None
 
 
-def _docx_text(path: Path) -> tuple[str, str | None] | None:
+def _docx_text(path: Path) -> tuple[str, str | None]:
     try:
         from docx import Document
         from docx.table import Table
     except ImportError:
         _missing_extra(path, "docx")
-        return None
     document = Document(str(path))
     title = None
     parts = []
@@ -126,7 +129,7 @@ def _docx_text(path: Path) -> tuple[str, str | None] | None:
 
 
 def extract_file(path: Path) -> tuple[str, str | None] | None:
-    """Return (text, title or None). None means the file was skipped."""
+    """Return (text, title) or None for unsupported files. Missing extras raise MissingExtra."""
     suffix = path.suffix.lower()
     if suffix in (".md", ".markdown"):
         text = _read_text(path)

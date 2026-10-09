@@ -31,6 +31,16 @@ def test_init_explicit_directory_reminds_about_config(home, tmp_path):
     assert (target / "corpussync.toml").is_file()
 
 
+def test_init_preserves_existing_custom_home(home, capsys):
+    """source: round 3 item 1, init must preserve the permissions of an existing custom home too."""
+    from corpussync.cli import cmd_init
+
+    home.chmod(0o755)
+    assert cmd_init(None) == 0
+    assert home.stat().st_mode & 0o777 == 0o755
+    assert (home / "corpussync.toml").is_file()
+
+
 @pytest.mark.parametrize("host,expected", [
     ("localhost", "http://localhost:1234"),
     ("localhost:5678", "http://localhost:5678"),
@@ -52,6 +62,23 @@ def test_ollama_base_url(host, expected):
 def test_local_host_classification(host, local):
     """source: defect 6, only loopback endpoints and filesystem paths count as local."""
     assert is_local_host(host) is local
+
+
+@pytest.mark.parametrize("host", [
+    "0.0.0.0", "0.0.0.0:11434", "http://0.0.0.0", "http://0.0.0.0:11434",
+    "::", "[::]", "[::]:11434", "http://[::]", "http://[::]:11434",
+])
+def test_unspecified_hosts_are_local(host):
+    """source: round 3 item 2, unspecified IPv4 and IPv6 addresses refer to this machine."""
+    assert is_local_host(host)
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0:11434", "http://[::]:11434"])
+def test_unspecified_ollama_host_has_no_remote_notice(home, monkeypatch, capsys, host):
+    """source: round 3 item 2, a local Ollama bind address must not warn that text leaves the machine."""
+    monkeypatch.setenv("OLLAMA_HOST", host)
+    privacy_notices(load_settings())
+    assert capsys.readouterr().err == ""
 
 
 def test_remote_privacy_notices(home, capsys):

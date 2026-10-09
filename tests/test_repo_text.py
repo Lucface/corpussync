@@ -73,13 +73,13 @@ def test_modules_defer_annotations_and_parse_on_python39():
 
 
 def test_setup_metadata_and_legacy_editable_entry():
-    """source: defect 2, setuptools metadata packages the CLI, dependencies and extras for Python 3.9."""
+    """source: defect 2 and round 3 item 6, metadata resolves the package version and keeps the Python 3.9 CLI."""
     import configparser
 
     config = configparser.ConfigParser()
     config.read(REPO / "setup.cfg")
     assert config["metadata"]["name"] == "corpussync"
-    assert config["metadata"]["version"] == "attr: corpussync.__version__"
+    assert config["metadata"]["version"] == "attr: corpussync.__init__.__version__"
     assert config["options"]["packages"] == "corpussync"
     assert config["options"]["python_requires"] == ">=3.9"
     assert config["options"]["install_requires"].split() == ["qdrant-client>=1.10", "requests>=2.31"]

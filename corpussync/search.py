@@ -38,6 +38,8 @@ class SearchResult:
     coverage: dict = field(default_factory=dict)
     notices: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+    error: str | None = None  # First error when every selected collection failed.
 
 
 def no_match_message(corpora: list[str]) -> str:
@@ -122,6 +124,7 @@ def search(ctx, query: str, corpora: list[str], k: int = 8, mode: str = "hybrid"
     vectors = {}
     vector_errors = {}
     candidates = []
+    first_error = None
     limit = max(4 * k, 20)
     for collection in selected:
         corpus = corpus_label(collection)
@@ -195,7 +198,12 @@ def search(ctx, query: str, corpora: list[str], k: int = 8, mode: str = "hybrid"
                 group.append((hit, rank))
             candidates.extend(group)
         except Exception as exc:
+            if first_error is None:
+                first_error = str(exc)[:120]
+            result.failed.append(collection)
             result.notices.append(f"{corpus}: skipped ({str(exc)[:80]})")
+    if selected and len(result.failed) == len(selected):
+        result.error = first_error
     if mode == "keyword":
         ordered = sorted(candidates, key=lambda item: (-item[0].keyword_coverage, item[1], _tie(item[0])))
         hits = [hit for hit, _rank in ordered]

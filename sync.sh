@@ -163,9 +163,13 @@ for entry in "${CHANNELS[@]}"; do
       continue
     fi
     [ "$pulled" -ge "$PER_RUN_CAP" ] && break
-    yt-dlp ${YT_COOKIES[@]+"${YT_COOKIES[@]}"} --write-auto-subs --sub-langs en --skip-download \
-      -o "$CAP_DIR/%(id)s.%(ext)s" "https://youtu.be/$vid" >/dev/null 2>&1 || true
-    if ! ls "$CAP_DIR/$vid".*.vtt >/dev/null 2>&1; then
+    if yt-dlp ${YT_COOKIES[@]+"${YT_COOKIES[@]}"} --write-auto-subs --sub-langs en --skip-download \
+      -o "$CAP_DIR/%(id)s.%(ext)s" "https://youtu.be/$vid" >/dev/null 2>&1; then
+      ok=1
+    else
+      ok=0
+    fi
+    if [ "$ok" -eq 1 ] && ! ls "$CAP_DIR/$vid".*.vtt >/dev/null 2>&1; then
       printf '%s\n' "$vid" >> "$NO_CAPTIONS"
     fi
     pulled=$((pulled + 1))

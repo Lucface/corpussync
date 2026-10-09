@@ -5,8 +5,44 @@ from __future__ import annotations
 import json
 import sys
 
+import pytest
+
 from corpussync.config import load_settings, loads_toml_minimal
 from tests.conftest import REPO, run_cli
+
+
+@pytest.mark.parametrize("answer_model,pulled,missing", [
+    ("llama3.2", [], True),
+    ("llama3.2", ["llama3.2"], False),
+    ("llama3.2", ["llama3.2:latest"], False),
+    ("llama3.2:small", ["llama3.2:small"], False),
+    ("llama3.2:small", ["llama3.2:latest"], True),
+])
+def test_doctor_answer_model_is_warning_only(ctx, monkeypatch, capsys, answer_model, pulled, missing):
+    """source: round 3 item 7, doctor checks answer model names and tags without failing on a missing model."""
+    from types import SimpleNamespace
+    from corpussync.cli import cmd_doctor
+
+    ctx.settings.answer_model = answer_model
+    names = [ctx.settings.embed_model + ":latest"] + pulled
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append(url)
+        return SimpleNamespace(raise_for_status=lambda: None,
+                               json=lambda: {"models": [{"name": name} for name in names]})
+
+    monkeypatch.setattr("corpussync.cli.requests.get", get)
+    monkeypatch.setattr("corpussync.cli.shutil.which", lambda name: str(ctx.settings.home / name))
+    assert cmd_doctor(ctx) == 0
+    output = capsys.readouterr().out
+    assert f"embed model {ctx.settings.embed_model}: ok" in output
+    warning = f"warning: answer model {answer_model} is not pulled (only ask needs it). Fix: ollama pull {answer_model}"
+    if missing:
+        assert warning in output
+    else:
+        assert "warning: answer model" not in output
+    assert calls == ["http://127.0.0.1:11434/api/tags"]
 
 
 def test_help_lists_commands():

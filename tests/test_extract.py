@@ -6,6 +6,8 @@ import builtins
 import sys
 from pathlib import Path
 
+import pytest
+
 from corpussync.extract import extract_file
 from corpussync.vtt import clean_srt, clean_vtt
 
@@ -113,22 +115,28 @@ def _block_import(monkeypatch, root_name):
 
 
 def test_pdf_skipped_when_extra_missing(tmp_path, monkeypatch, capsys):
-    """source: a missing pdf extra skips the file with one line naming the extra."""
+    """source: round 3 item 4, a missing pdf extra raises a dedicated skip with one diagnostic."""
+    from corpussync.extract import MissingExtra
+
     _block_import(monkeypatch, "pypdf")
     path = tmp_path / "note.pdf"
     path.write_bytes(b"%PDF-1.4\n")
-    assert extract_file(path) is None
+    with pytest.raises(MissingExtra):
+        extract_file(path)
     captured = capsys.readouterr()
     assert "[pdf]" in captured.out
     assert "Traceback" not in captured.err
 
 
 def test_docx_skipped_when_extra_missing(tmp_path, monkeypatch, capsys):
-    """source: a missing docx extra skips the file with one line naming the extra."""
+    """source: round 3 item 4, a missing docx extra raises a dedicated skip with one diagnostic."""
+    from corpussync.extract import MissingExtra
+
     _block_import(monkeypatch, "docx")
     path = tmp_path / "note.docx"
     path.write_bytes(b"not a document")
-    assert extract_file(path) is None
+    with pytest.raises(MissingExtra):
+        extract_file(path)
     captured = capsys.readouterr()
     assert "[docx]" in captured.out
     assert "Traceback" not in captured.err

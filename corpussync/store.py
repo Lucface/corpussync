@@ -16,7 +16,7 @@ from qdrant_client.models import (
     VectorParams,
 )
 
-from corpussync.config import Settings, private_directory
+from corpussync.config import Settings, private_directory, private_home
 from corpussync.names import check_name
 from corpussync.state import legacy_state_path
 
@@ -40,15 +40,13 @@ def retry(fn, what: str, tries: int = 5, delay: float = 2.0):
 
 
 def make_client(settings: Settings) -> QdrantClient:
-    private_directory(settings.home, tighten=True)
+    private_home(settings.home, warn=True)
     path = settings.home / "qdrant"
-    if path.exists():
-        private_directory(path, tighten=True)
+    private_directory(path, tighten=True)
     if settings.qdrant_url:
         return QdrantClient(url=settings.qdrant_url, timeout=30)
     if settings.qdrant_host:
         return QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port, timeout=30)
-    private_directory(path, tighten=True)
     try:
         return QdrantClient(path=str(path))
     except Exception as exc:

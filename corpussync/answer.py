@@ -62,12 +62,15 @@ def _prompt(question: str, result) -> str:
 
 def ask(ctx, question: str, corpora: list[str], k: int = 6, model: str | None = None,
         min_score: float | None = None, collections: list[str] | None = None) -> int:
-    """Search, then ask the chat model. Returns 2 without calling the model when nothing clears the floor."""
+    """Search, then ask the model. Search failures return 1; no match returns 2 without chat."""
     result = search(ctx, question, corpora, k=k, mode="hybrid", min_score=min_score, collections=collections)
     print_notices(result.notices)
     for corpus in result.missing:
         print(f"{corpus}: not found", file=sys.stderr)
     if not result.results:
+        if result.error is not None:
+            print(f"could not search: {result.error}", file=sys.stderr)
+            return 1
         print(no_match_message(list(corpora) + list(collections or [])))
         return 2
     chosen = model or ctx.settings.answer_model

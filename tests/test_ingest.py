@@ -5,6 +5,8 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
+import pytest
+
 from qdrant_client.models import FieldCondition
 
 from corpussync.ingest import ingest_document, ingest_paths, speaker_from_title
@@ -251,7 +253,7 @@ def test_five_word_note_becomes_one_point(ctx, tmp_path):
 
 
 def test_extraction_failure_and_write_failure_return_one(ctx, tmp_path, monkeypatch, capsys):
-    """source: defect 8, extraction and write errors contribute to failure counts and exit 1."""
+    """source: defect 8 and round 3 item 4, extraction and write errors count as failures rather than skips."""
     path = tmp_path / "note.txt"
     path.write_text("five words make this note")
 
@@ -264,7 +266,30 @@ def test_extraction_failure_and_write_failure_return_one(ctx, tmp_path, monkeypa
     with monkeypatch.context() as patch:
         patch.setattr(ctx.embedder, "embed_documents", fail)
         assert ingest_paths(ctx, [path], "notes") == 1
-    assert "DONE: 0 files, 0 chunks, 0 removed, 1 failed -> notes-corpus" in capsys.readouterr().out
+    assert "DONE: 0 files, 0 chunks, 0 removed, 0 skipped, 1 failed -> notes-corpus" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("extra,module", [("pdf", "pypdf"), ("docx", "docx")])
+def test_missing_extra_skips_without_pruning(ctx, tmp_path, monkeypatch, capsys, extra, module):
+    """source: round 3 item 4, missing extras exit zero, count as skipped and preserve existing indexed files."""
+    from corpussync.state import saved_hash, store_identity
+    from tests.test_extract import _block_import
+
+    root = tmp_path / "notes"
+    root.mkdir()
+    path = root / ("document." + extra)
+    path.write_bytes(b"placeholder")
+    ingest_document(ctx, text="previously extracted document text", source_file=str(path.resolve()),
+                    corpus="notes", title="Document", locator=path.name)
+    (root / "note.txt").write_text("new text note")
+    _block_import(monkeypatch, module)
+    capsys.readouterr()
+    assert ingest_paths(ctx, [root], "notes") == 0
+    assert "DONE: 1 files, 1 chunks, 0 removed, 1 skipped, 0 failed -> notes-corpus" in capsys.readouterr().out
+    assert {point.payload["source_file"] for point in _scroll(ctx, "notes")} == {
+        str(path.resolve()), str((root / "note.txt").resolve()),
+    }
+    assert saved_hash(ctx.db, store_identity(ctx.settings), "notes-corpus", str(path.resolve())) is not None
 
 
 def test_caption_digest_matches_raw_legacy_hash_and_rebuild(ctx, tmp_path, capsys):
