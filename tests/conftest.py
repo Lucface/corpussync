@@ -1,5 +1,7 @@
 """Shared fixtures. Every test stays offline and inside tmp paths."""
 
+from __future__ import annotations
+
 import os
 import subprocess
 import sys
@@ -16,6 +18,10 @@ _CLEAR = (
     "CORPUSSYNC_STATE",
     "CORPUSSYNC_EMBED_MODEL",
     "CORPUSSYNC_EMBED_DIM",
+    "CORPUSSYNC_STORE",
+    "CORPUSSYNC_LEGACY_QDRANT",
+    "OLLAMA_HOST",
+    "OLLAMA_PORT",
 )
 
 
@@ -62,3 +68,14 @@ def ctx(home):
         yield context
     finally:
         context.close()
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """source: round 2 tests never send HTTP requests, including a compat probe."""
+    import requests
+
+    def blocked(*args, **kwargs):
+        raise AssertionError("test attempted an HTTP request")
+
+    monkeypatch.setattr(requests.sessions.Session, "request", blocked)

@@ -9,6 +9,8 @@ This file keeps the original flags and re-exports clean_vtt and chunk:
   python3 corpussync.py --source mychannel --stats
 """
 
+from __future__ import annotations
+
 from corpussync.chunking import chunk
 from corpussync.cli import main_compat
 from corpussync.vtt import clean_vtt

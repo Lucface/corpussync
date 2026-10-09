@@ -1,5 +1,7 @@
 """source: the 0.1 shim and sync.sh keep their contracts."""
 
+from __future__ import annotations
+
 import importlib.util
 import subprocess
 import sys
@@ -67,3 +69,23 @@ def test_sync_sh_parses_on_bash_without_mapfile():
     proc = subprocess.run(["bash", "-n", str(REPO / "sync.sh")], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
     assert Path(REPO / "sync.sh").exists()
+
+
+def test_compat_remote_notice_precedes_legacy_probe(home, monkeypatch, capsys):
+    """source: defects 6 and 27, a remote compat destination is disclosed before probing it."""
+    from types import SimpleNamespace
+    from corpussync.cli import main_compat
+    from tests.test_state import make_legacy
+
+    make_legacy(home / "ingestion-state.db")
+    monkeypatch.setenv("CORPUSSYNC_LEGACY_QDRANT", "https://legacy.example")
+    calls = []
+
+    def probe(url, timeout):
+        calls.append((url, timeout))
+        assert capsys.readouterr().err == "note: document text goes to https://legacy.example (Qdrant)\n"
+        return SimpleNamespace(status_code=503)
+
+    assert main_compat(["--source", "notes", "--captions", str(home / "captions")], probe=probe) == 2
+    assert calls == [("https://legacy.example/collections", 1)]
+    assert "no Qdrant server answers" in capsys.readouterr().err

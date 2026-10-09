@@ -1,5 +1,7 @@
 """source: ingest hash-skips unchanged files, drops stale chunks after upsert, and uses stable ids."""
 
+from __future__ import annotations
+
 import uuid
 from pathlib import Path
 
@@ -27,12 +29,12 @@ class _CountingEmbedder:
         self.inner = inner
         self.docs = 0
 
-    def embed_documents(self, texts):
+    def embed_documents(self, texts, prefixed=True):
         self.docs += 1
-        return self.inner.embed_documents(texts)
+        return self.inner.embed_documents(texts, prefixed=prefixed)
 
-    def embed_query(self, text):
-        return self.inner.embed_query(text)
+    def embed_query(self, text, prefixed=True):
+        return self.inner.embed_query(text, prefixed=prefixed)
 
 
 class _RecordingClient:
@@ -146,3 +148,181 @@ def test_speaker_from_title_falls_back_to_the_channel_handle():
     assert speaker_from_title("A talk - Alex Example", "@YourChannel") == "Alex Example"
     ended = "A talk " + chr(0x2013) + " Alex Example"
     assert speaker_from_title(ended, "@YourChannel") == "Alex Example"
+
+
+def test_same_file_enters_two_corpora(ctx, tmp_path):
+    """source: defect 3, a matching file hash in one corpus cannot skip another corpus."""
+    path = tmp_path / "note.txt"
+    path.write_text("five words make this note")
+    assert ingest_paths(ctx, [path], "first") == 0
+    assert ingest_paths(ctx, [path], "second") == 0
+    assert len(_scroll(ctx, "first")) == len(_scroll(ctx, "second")) == 1
+
+
+def test_wiped_store_invalidates_every_row_before_partial_rebuild(ctx, tmp_path):
+    """source: defects 3 and 26, recreating a collection clears all old hashes before one file is rebuilt."""
+    root = tmp_path / "notes"
+    root.mkdir()
+    first = root / "first.txt"
+    second = root / "second.txt"
+    first.write_text("five words make this note")
+    second.write_text("five words make another note")
+    assert ingest_paths(ctx, [root], "notes") == 0
+    counter = _CountingEmbedder(ctx.embedder)
+    ctx.embedder = counter
+    ctx.client.delete_collection("notes-corpus")
+    assert ingest_paths(ctx, [first], "notes") == 0
+    assert counter.docs == 1
+    assert ingest_paths(ctx, [root], "notes") == 0
+    assert counter.docs == 2
+    assert len(_scroll(ctx, "notes")) == 2
+
+
+def test_switching_store_does_not_reuse_hashes(ctx, tmp_path):
+    """source: defect 3, a second embedded store receives files even with the same state database."""
+    path = tmp_path / "note.txt"
+    path.write_text("five words make this note")
+    assert ingest_paths(ctx, [path], "notes") == 0
+    ctx.close()
+    ctx.settings.home = tmp_path / "other-home"
+    assert ingest_paths(ctx, [path], "notes") == 0
+    assert len(_scroll(ctx, "notes")) == 1
+
+
+def test_prune_deleted_renamed_and_keep_missing(ctx, tmp_path, capsys):
+    """source: defect 4, a complete folder scan prunes absent files unless keep-missing is set."""
+    root = tmp_path / "notes"
+    root.mkdir()
+    path = root / "old.txt"
+    path.write_text("five words make this note")
+    assert ingest_paths(ctx, [root], "notes") == 0
+    path.rename(root / "new.txt")
+    assert ingest_paths(ctx, [root], "notes", keep_missing=True) == 0
+    assert len(_scroll(ctx, "notes")) == 2
+    assert ingest_paths(ctx, [root], "notes") == 0
+    assert len(_scroll(ctx, "notes")) == 1
+    assert "removed old.txt (no longer on disk)" in capsys.readouterr().out
+    (root / "new.txt").unlink()
+    assert ingest_paths(ctx, [root], "notes") == 0
+    assert _scroll(ctx, "notes") == []
+
+
+def test_file_and_missing_root_never_prune(ctx, tmp_path):
+    """source: defect 4, individual files and missing roots cannot remove a folder's state."""
+    root = tmp_path / "notes"
+    root.mkdir()
+    first, second = root / "first.txt", root / "second.txt"
+    first.write_text("five words make this note")
+    second.write_text("five words make another note")
+    assert ingest_paths(ctx, [root], "notes") == 0
+    second.unlink()
+    assert ingest_paths(ctx, [first], "notes") == 0
+    assert len(_scroll(ctx, "notes")) == 2
+    root.rename(tmp_path / "renamed")
+    assert ingest_paths(ctx, [root], "notes") == 1
+    assert len(_scroll(ctx, "notes")) == 2
+
+
+def test_failed_scan_never_prunes(ctx, tmp_path, monkeypatch):
+    """source: defect 4, incomplete scans retain existing points and report failure."""
+    root = tmp_path / "notes"
+    root.mkdir()
+    path = root / "note.txt"
+    path.write_text("five words make this note")
+    ingest_paths(ctx, [root], "notes")
+
+    def failed_walk(path, onerror):
+        onerror(OSError("scan interrupted"))
+        return iter([])
+
+    monkeypatch.setattr("corpussync.ingest.os.walk", failed_walk)
+    assert ingest_paths(ctx, [root], "notes") == 1
+    assert len(_scroll(ctx, "notes")) == 1
+
+
+def test_five_word_note_becomes_one_point(ctx, tmp_path):
+    """source: defect 12, notes below chunk's minimum still produce one normalized point."""
+    path = tmp_path / "short.txt"
+    path.write_text("five  words\nmake this\t note")
+    assert ingest_paths(ctx, [path], "notes") == 0
+    points = _scroll(ctx, "notes")
+    assert len(points) == 1
+    assert points[0].payload["text"] == "five words make this note"
+
+
+def test_extraction_failure_and_write_failure_return_one(ctx, tmp_path, monkeypatch, capsys):
+    """source: defect 8, extraction and write errors contribute to failure counts and exit 1."""
+    path = tmp_path / "note.txt"
+    path.write_text("five words make this note")
+
+    def fail(*args, **kwargs):
+        raise ValueError("synthetic failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("corpussync.ingest.extract_file", fail)
+        assert ingest_paths(ctx, [path], "notes") == 1
+    with monkeypatch.context() as patch:
+        patch.setattr(ctx.embedder, "embed_documents", fail)
+        assert ingest_paths(ctx, [path], "notes") == 1
+    assert "DONE: 0 files, 0 chunks, 0 removed, 1 failed -> notes-corpus" in capsys.readouterr().out
+
+
+def test_caption_digest_matches_raw_legacy_hash_and_rebuild(ctx, tmp_path, capsys):
+    """source: defect 26, raw VTT hashes skip old captions and collection recreation re-ingests every file."""
+    from corpussync.ingest import ingest_youtube
+    from corpussync.state import content_hash, save_hash, store_identity
+    from corpussync.store import ensure_collection
+
+    root = tmp_path / "captions"
+    root.mkdir()
+    raw = "WEBVTT\n\n00:00:00.000 --> 00:00:05.000\n" + _words(40) + "\n"
+    first, second = root / "first.en.vtt", root / "second.en.vtt"
+    first.write_text(raw)
+    second.write_text(raw)
+    ensure_collection(ctx.client, "notes-corpus", ctx.settings.embed_dim)
+    save_hash(ctx.db, store_identity(ctx.settings), str(first), content_hash(raw), "", "notes-corpus", 1)
+    counter = _CountingEmbedder(ctx.embedder)
+    ctx.embedder = counter
+    assert ingest_youtube(ctx, root, None, "notes", "@YourChannel", "silver", False) == 0
+    assert counter.docs == 1
+    assert len(_scroll(ctx, "notes")) == 1
+    ctx.client.delete_collection("notes-corpus")
+    assert ingest_youtube(ctx, root, None, "notes", "@YourChannel", "silver", False) == 0
+    assert counter.docs == 3
+    assert len(_scroll(ctx, "notes")) == 2
+    assert "DONE: 2 files, 2 chunks, 0 failed -> notes-corpus" in capsys.readouterr().out
+
+
+def test_missing_and_failed_captions_return_one(ctx, tmp_path, monkeypatch, capsys):
+    """source: defect 8, a missing caption directory or failed caption returns 1 and a final count."""
+    from corpussync.ingest import ingest_youtube
+
+    root = tmp_path / "captions"
+    assert ingest_youtube(ctx, root, None, "notes", "@YourChannel", "silver", False) == 1
+    root.mkdir()
+    (root / "demo.en.vtt").write_text("WEBVTT\n\n" + _words(40))
+
+    def fail(*args, **kwargs):
+        raise ValueError("synthetic caption failure")
+
+    monkeypatch.setattr(ctx.embedder, "embed_documents", fail)
+    assert ingest_youtube(ctx, root, None, "notes", "@YourChannel", "silver", False) == 1
+    assert "DONE: 0 files, 0 chunks, 1 failed -> notes-corpus" in capsys.readouterr().out
+
+
+def test_one_collection_listing_per_ingest(ctx, tmp_path, monkeypatch):
+    """source: defect 3, collection existence is fetched once and cached throughout an ingest run."""
+    root = tmp_path / "notes"
+    root.mkdir()
+    for name in ("first", "second"):
+        (root / (name + ".txt")).write_text("five words make this note")
+    original = ctx.client.get_collections
+    calls = []
+
+    def listed():
+        calls.append(True)
+        return original()
+
+    monkeypatch.setattr(ctx.client, "get_collections", listed)
+    assert ingest_paths(ctx, [root], "notes") == 0
+    assert calls == [True]

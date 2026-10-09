@@ -1,5 +1,7 @@
 """source: extract reads notes and captions, and skips pdf or docx when the extra is missing."""
 
+from __future__ import annotations
+
 import builtins
 import sys
 from pathlib import Path
@@ -130,3 +132,28 @@ def test_docx_skipped_when_extra_missing(tmp_path, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "[docx]" in captured.out
     assert "Traceback" not in captured.err
+
+
+def test_docx_tables_keep_document_order(tmp_path):
+    """source: defect 11, DOCX tables, nested cells and headings survive in document order."""
+    import pytest
+
+    docx = pytest.importorskip("docx")
+    doc = docx.Document()
+    doc.add_paragraph("Before")
+    table = doc.add_table(rows=1, cols=2)
+    table.cell(0, 0).text = "Left"
+    nested = table.cell(0, 0).add_table(rows=1, cols=1)
+    nested.cell(0, 0).text = "Nested"
+    table.cell(0, 1).text = "Right"
+    doc.add_heading("First heading", level=1)
+    doc.add_paragraph("After")
+    path = tmp_path / "tables.docx"
+    doc.save(path)
+    text, title = extract_file(path)
+    assert text.splitlines() == ["Before", "Left", "Nested", "Right", "First heading", "After"]
+    assert title == "First heading"
+    only = docx.Document()
+    only.add_table(rows=1, cols=1).cell(0, 0).text = "Table only"
+    only.save(path)
+    assert extract_file(path) == ("Table only", None)

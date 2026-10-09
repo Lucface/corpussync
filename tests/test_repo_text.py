@@ -1,5 +1,7 @@
 """source: repository text follows the public-repo wording rules."""
 
+from __future__ import annotations
+
 import re
 import subprocess
 
@@ -52,3 +54,35 @@ def test_channels_example_has_only_placeholder_handles():
     assert handles
     assert set(handles) <= {"@YourChannel", "@handle"}
     assert "@YourChannel" in handles
+
+
+def test_modules_defer_annotations_and_parse_on_python39():
+    """source: defect 15, every package and test module defers annotations and uses Python 3.9 syntax."""
+    import ast
+
+    paths = list((REPO / "corpussync").glob("*.py")) + list((REPO / "tests").glob("*.py")) + [REPO / "corpussync.py"]
+    for path in paths:
+        tree = ast.parse(path.read_text(), feature_version=(3, 9))
+        statements = tree.body
+        if statements and isinstance(statements[0], ast.Expr) and isinstance(statements[0].value, ast.Constant) and isinstance(statements[0].value.value, str):
+            statements = statements[1:]
+        assert statements, str(path)
+        first = statements[0]
+        assert isinstance(first, ast.ImportFrom) and first.module == "__future__", str(path)
+        assert any(alias.name == "annotations" for alias in first.names), str(path)
+
+
+def test_setup_metadata_and_legacy_editable_entry():
+    """source: defect 2, setuptools metadata packages the CLI, dependencies and extras for Python 3.9."""
+    import configparser
+
+    config = configparser.ConfigParser()
+    config.read(REPO / "setup.cfg")
+    assert config["metadata"]["name"] == "corpussync"
+    assert config["metadata"]["version"] == "attr: corpussync.__version__"
+    assert config["options"]["packages"] == "corpussync"
+    assert config["options"]["python_requires"] == ">=3.9"
+    assert config["options"]["install_requires"].split() == ["qdrant-client>=1.10", "requests>=2.31"]
+    assert config["options.entry_points"]["console_scripts"].strip() == "corpussync = corpussync.cli:main"
+    assert dict(config["options.extras_require"]) == {"pdf": "pypdf>=4", "docx": "python-docx>=1.1", "dev": "pytest>=8"}
+    assert (REPO / "setup.py").read_text() == "from setuptools import setup\nsetup()\n"

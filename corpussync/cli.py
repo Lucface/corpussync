@@ -1,19 +1,24 @@
 """Command line: init, ingest, youtube, search, ask, stats, list, remove, doctor."""
 
+from __future__ import annotations
+
 import argparse
 import json
+import os
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import requests
 
 from corpussync.answer import ask
-from corpussync.config import config_template, load_context
+from corpussync.config import DEFAULT_HOME, config_template, load_context, ollama_base_url, private_directory, privacy_notices
+from corpussync.names import InvalidName, check_name
 from corpussync.ingest import ingest_paths, ingest_youtube
-from corpussync.search import no_match_message, print_coverage, print_hits, print_notices, search
-from corpussync.state import delete_collection_rows
-from corpussync.store import collection_names, layout_label, list_corpora, point_count
+from corpussync.search import no_match_message, print_coverage, print_hits, print_notices, search, select_collections
+from corpussync.state import delete_collection_rows, store_identity, legacy_state_path
+from corpussync.store import collection_names, layout_label, point_count, resolve_collection, legacy_store_choice, legacy_server_answers, legacy_address
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -28,6 +33,7 @@ def _parser() -> argparse.ArgumentParser:
     ingest.add_argument("paths", nargs="+")
     ingest.add_argument("--corpus", required=True)
     ingest.add_argument("--force", action="store_true")
+    ingest.add_argument("--keep-missing", action="store_true")
 
     youtube = sub.add_parser("youtube", help="ingest a directory of YouTube captions")
     youtube.add_argument("--captions", required=True)
@@ -41,6 +47,8 @@ def _parser() -> argparse.ArgumentParser:
     find = sub.add_parser("search", help="search one or more corpora")
     find.add_argument("query")
     find.add_argument("--corpus", action="append", default=[])
+    find.add_argument("--collection", action="append", default=[])
+    find.add_argument("--min-score", type=float)
     find.add_argument("--all", action="store_true", dest="search_all")
     find.add_argument("-k", type=int, default=8)
     find.add_argument("--mode", choices=["hybrid", "dense", "keyword"], default="hybrid")
@@ -49,17 +57,22 @@ def _parser() -> argparse.ArgumentParser:
     question = sub.add_parser("ask", help="answer a question from the corpus with a local model")
     question.add_argument("question")
     question.add_argument("--corpus", action="append", default=[])
+    question.add_argument("--collection", action="append", default=[])
+    question.add_argument("--min-score", type=float)
     question.add_argument("--all", action="store_true", dest="search_all")
     question.add_argument("-k", type=int, default=6)
     question.add_argument("--model")
 
     stats = sub.add_parser("stats", help="point count for one corpus, or every corpus")
     stats.add_argument("--corpus")
+    stats.add_argument("--collection", action="append", default=[])
 
     listed = sub.add_parser("list", help="each corpus with its point count and layout")
 
     remove = sub.add_parser("remove", help="drop a corpus and its state rows")
-    remove.add_argument("--corpus", required=True)
+    selection = remove.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--corpus")
+    selection.add_argument("--collection")
     remove.add_argument("--yes", action="store_true")
 
     doctor = sub.add_parser("doctor", help="check Ollama, the embed model, the store, and yt-dlp")
@@ -68,17 +81,18 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _corpora(ctx, args) -> list[str] | None:
-    if not args.search_all and not args.corpus:
-        print("pass --corpus NAME or --all", file=sys.stderr)
+def _corpora(ctx, args):
+    if not args.search_all and not args.corpus and not args.collection:
+        print("pass --corpus NAME, --collection NAME or --all", file=sys.stderr)
         return None
-    names: list[str] = []
+    names = list(args.collection)
     if args.search_all:
-        names.extend(list_corpora(ctx.client))
-    for name in args.corpus or []:
-        if name not in names:
-            names.append(name)
-    return names
+        names.extend(sorted(ctx.collections))
+    exact = []
+    for name in names:
+        if name not in exact:
+            exact.append(name)
+    return list(args.corpus), exact
 
 
 def _result_payload(query: str, mode: str, result) -> dict:
@@ -90,6 +104,8 @@ def _result_payload(query: str, mode: str, result) -> dict:
                 "n": hit.n,
                 "corpus": hit.corpus,
                 "score": hit.score,
+                "relevance": hit.relevance,
+                "keyword_coverage": hit.keyword_coverage,
                 "title": hit.title,
                 "locator": hit.locator,
                 "url": hit.url,
@@ -104,8 +120,11 @@ def _result_payload(query: str, mode: str, result) -> dict:
 
 
 def cmd_init(directory: str | None) -> int:
-    folder = Path(directory).expanduser() if directory else Path.cwd()
-    folder.mkdir(parents=True, exist_ok=True)
+    home = Path(os.environ.get("CORPUSSYNC_HOME", DEFAULT_HOME)).expanduser()
+    folder = Path(directory).expanduser() if directory else home
+    private_directory(folder, tighten=folder.resolve() == home.resolve())
+    if folder.resolve() != home.resolve():
+        print("a file outside CORPUSSYNC_HOME is read only through --config")
     target = folder / "corpussync.toml"
     if target.exists():
         print(f"left existing corpussync.toml at {target}")
@@ -126,10 +145,13 @@ def stats_collection(ctx, collection: str) -> int:
     return 0
 
 
-def cmd_stats(ctx, corpus: str | None) -> int:
-    if corpus:
-        return stats_collection(ctx, f"{corpus}-corpus")
-    names = sorted(collection_names(ctx.client))
+def cmd_stats(ctx, corpus: str | None, collections=None) -> int:
+    if corpus or collections:
+        names, missing = select_collections(ctx, [corpus] if corpus else [], collections)
+        for name in missing:
+            print(f"{name}: not found")
+    else:
+        names = sorted(ctx.collections)
     if not names:
         print("no corpora")
         return 0
@@ -139,22 +161,27 @@ def cmd_stats(ctx, corpus: str | None) -> int:
 
 
 def cmd_list(ctx) -> int:
-    names = sorted(collection_names(ctx.client))
+    names = sorted(ctx.collections)
     if not names:
         print("no corpora")
         return 0
     for name in names:
-        label = layout_label(ctx.client, name)
+        label = layout_label(ctx.client, name, ctx.settings.embed_dim)
         count = point_count(ctx.client, name)
         corpus = name[: -len("-corpus")] if name.endswith("-corpus") else name
-        print(f"{corpus}  {count} points  {label}")
+        print(f"{corpus}  {count} points  {label}  ({name})")
     return 0
 
 
-def cmd_remove(ctx, corpus: str, yes: bool) -> int:
-    preferred = f"{corpus}-corpus"
-    existing = collection_names(ctx.client)
-    target = preferred if preferred in existing or corpus not in existing else corpus
+def cmd_remove(ctx, corpus: str | None, yes: bool, collection: str | None = None) -> int:
+    if collection:
+        check_name(collection, "collection")
+        target = collection if collection in ctx.collections else None
+    else:
+        target = resolve_collection(ctx, corpus)
+    if target is None:
+        print(f"{collection or corpus}: not found")
+        return 1
     if not yes:
         print(
             f"This drops collection {target} and its state rows. "
@@ -165,17 +192,20 @@ def cmd_remove(ctx, corpus: str, yes: bool) -> int:
         ctx.client.delete_collection(collection_name=target)
         print(f"removed {target}")
     except Exception as exc:
-        print(f"{target}: not found ({exc})")
-    delete_collection_rows(ctx.db, target)
-    if target != preferred:
-        delete_collection_rows(ctx.db, preferred)
+        print(f"{target}: could not remove ({exc})")
+        return 1
+    delete_collection_rows(ctx.db, store_identity(ctx.settings), target)
+    ctx.collections.discard(target)
     return 0
 
 
 def cmd_doctor(ctx) -> int:
     failed = False
     settings = ctx.settings
-    base = f"http://{settings.ollama_host}:{settings.ollama_port}"
+    base = ollama_base_url(settings)
+    if not settings.using_server() and legacy_state_path(settings) is not None:
+        if legacy_server_answers(requests.get):
+            print(f"note: a Qdrant server answers at {legacy_address()}, where 0.1 kept its corpora; set QDRANT_URL to search them")
     try:
         resp = requests.get(f"{base}/api/tags", timeout=5)
         resp.raise_for_status()
@@ -219,46 +249,64 @@ def cmd_doctor(ctx) -> int:
 
 
 def cmd_search(ctx, args) -> int:
-    corpora = _corpora(ctx, args)
-    if corpora is None:
+    selection = _corpora(ctx, args)
+    if selection is None:
         return 1
-    if not corpora:
+    corpora, collections = selection
+    if not corpora and not collections:
         print(no_match_message([]))
         return 2
-    result = search(ctx, args.query, corpora, k=args.k, mode=args.mode)
+    result = search(ctx, args.query, corpora, k=args.k, mode=args.mode,
+                    min_score=args.min_score, collections=collections)
     print_notices(result.notices)
     for corpus in result.missing:
-        print(f"{corpus}-corpus: not found", file=sys.stderr)
+        print(f"{corpus}: not found", file=sys.stderr)
     if not result.results:
-        print(no_match_message(corpora))
+        print(no_match_message(corpora + collections))
         return 2
     if args.json:
         print(json.dumps(_result_payload(args.query, args.mode, result)))
         return 0
     print_hits(result)
-    print_coverage(corpora, result.coverage)
+    print_coverage(list(result.coverage), result.coverage)
     return 0
 
 
 def cmd_ask(ctx, args) -> int:
-    corpora = _corpora(ctx, args)
-    if corpora is None:
+    selection = _corpora(ctx, args)
+    if selection is None:
         return 1
-    if not corpora:
+    corpora, collections = selection
+    if not corpora and not collections:
         print(no_match_message([]))
         return 2
-    return ask(ctx, args.question, corpora, k=args.k, model=args.model)
+    return ask(ctx, args.question, corpora, k=args.k, model=args.model,
+               min_score=args.min_score, collections=collections)
+
+
+def _validate_names(args) -> None:
+    for field, what in (("corpus", "corpus"), ("source", "source"), ("collection", "collection")):
+        value = getattr(args, field, None)
+        for name in value if isinstance(value, list) else ([value] if value is not None else []):
+            check_name(name, what)
 
 
 def main(argv=None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    try:
+        _validate_names(args)
+    except InvalidName as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if args.command == "init":
         return cmd_init(args.path)
     ctx = load_context(args.config)
     try:
+        if args.command in ("ingest", "youtube", "search", "ask"):
+            privacy_notices(ctx.settings)
         if args.command == "ingest":
-            return ingest_paths(ctx, [Path(item) for item in args.paths], args.corpus, args.force)
+            return ingest_paths(ctx, [Path(item) for item in args.paths], args.corpus, args.force, args.keep_missing)
         if args.command == "youtube":
             if args.collection:
                 ctx.collection_override = args.collection
@@ -276,11 +324,11 @@ def main(argv=None) -> int:
         if args.command == "ask":
             return cmd_ask(ctx, args)
         if args.command == "stats":
-            return cmd_stats(ctx, args.corpus)
+            return cmd_stats(ctx, args.corpus, args.collection)
         if args.command == "list":
             return cmd_list(ctx)
         if args.command == "remove":
-            return cmd_remove(ctx, args.corpus, args.yes)
+            return cmd_remove(ctx, args.corpus, args.yes, args.collection)
         if args.command == "doctor":
             return cmd_doctor(ctx)
     finally:
@@ -288,7 +336,7 @@ def main(argv=None) -> int:
     return 1
 
 
-def main_compat(argv=None) -> int:
+def main_compat(argv=None, probe=None) -> int:
     """0.1 flags: --captions, --titles, --source, --channel, --collection, --quality, --stats, --force."""
     ap = argparse.ArgumentParser(prog="corpussync.py")
     ap.add_argument("--captions", help="directory of .vtt caption files")
@@ -300,8 +348,26 @@ def main_compat(argv=None) -> int:
     ap.add_argument("--stats", action="store_true")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args(argv)
+    try:
+        _validate_names(args)
+    except InvalidName as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     ctx = load_context()
     try:
+        noted = False
+
+        def compat_probe(url, timeout):
+            nonlocal noted
+            if not args.stats:
+                privacy_notices(replace(ctx.settings, qdrant_url=legacy_address()))
+                noted = True
+            return (probe or requests.get)(url, timeout=timeout)
+
+        if legacy_store_choice(ctx.settings, compat_probe) == "stop":
+            return 2
+        if not args.stats and not noted:
+            privacy_notices(ctx.settings)
         collection = args.collection or f"{args.source}-corpus"
         if args.stats:
             return stats_collection(ctx, collection)

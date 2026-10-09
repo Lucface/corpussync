@@ -1,10 +1,14 @@
 """Dense embedders. Ollama batches at most 16 texts. Fake is deterministic and offline."""
 
+from __future__ import annotations
+
 import math
+from types import SimpleNamespace
 
 import requests
 
 from corpussync.sparse import split_tokens, term_id
+from corpussync.config import ollama_base_url
 
 _BATCH = 16
 _DOC_PREFIX = "search_document: "
@@ -14,14 +18,14 @@ _QUERY_PREFIX = "search_query: "
 class OllamaEmbedder:
     def __init__(self, host: str, port: int, model: str):
         self.model = model
-        self.base = f"http://{host}:{port}"
+        self.base = ollama_base_url(SimpleNamespace(ollama_host=host, ollama_port=port))
         self._nomic = "nomic-embed" in model.lower()
 
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return self._embed([self._document(text) for text in texts])
+    def embed_documents(self, texts: list[str], prefixed: bool = True) -> list[list[float]]:
+        return self._embed([self._document(text) if prefixed else text for text in texts])
 
-    def embed_query(self, text: str) -> list[float]:
-        return self._embed([self._query(text)])[0]
+    def embed_query(self, text: str, prefixed: bool = True) -> list[float]:
+        return self._embed([self._query(text) if prefixed else text])[0]
 
     def _document(self, text: str) -> str:
         if self._nomic:
@@ -63,10 +67,10 @@ class FakeEmbedder:
     def __init__(self, dim: int):
         self.dim = dim
 
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+    def embed_documents(self, texts: list[str], prefixed: bool = True) -> list[list[float]]:
         return [self._one(text) for text in texts]
 
-    def embed_query(self, text: str) -> list[float]:
+    def embed_query(self, text: str, prefixed: bool = True) -> list[float]:
         return self._one(text)
 
     def _one(self, text: str) -> list[float]:

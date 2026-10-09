@@ -14,6 +14,7 @@
 # YouTube limits requests without one.
 # PER_RUN_CAP caps new caption pulls per channel per run (default 250).
 set -uo pipefail
+umask 077
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 INGEST="$HERE/corpussync.py"
@@ -21,15 +22,16 @@ INGEST="$HERE/corpussync.py"
 toml_val() {
   local key file line val
   key="$1"
-  file="$HERE/corpussync.toml"
+  file="$CONFIG_FILE"
   [ -f "$file" ] || return 0
   line=$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null | head -n 1 || true)
   [ -z "$line" ] && return 0
   val=${line#*=}
-  val=$(printf '%s' "$val" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]\+#.*$//')
+  val=$(printf '%s' "$val" | sed -E 's/^[[:space:]]*//; s/[[:space:]]*$//')
   case "$val" in
-    \"*\") val=${val#\"}; val=${val%\"} ;;
-    \'*\') val=${val#\'}; val=${val%\'} ;;
+    \"*) val=${val#\"}; val=${val%%\"*} ;;
+    \'*) val=${val#\'}; val=${val%%\'*} ;;
+    *) val=${val%%#*}; val=$(printf '%s' "$val" | sed -E 's/[[:space:]]*$//') ;;
   esac
   printf '%s' "$val"
 }
@@ -40,13 +42,16 @@ expand_tilde() {
       printf '%s' "$HOME"
       ;;
     "~/"*)
-      printf '%s/%s' "$HOME" "${1#~/}"
+      printf '%s/%s' "$HOME" "${1#"~/"}"
       ;;
     *)
       printf '%s' "$1"
       ;;
   esac
 }
+
+CONFIG_HOME=$(expand_tilde "${CORPUSSYNC_HOME:-$HOME/.corpussync}")
+CONFIG_FILE="$CONFIG_HOME/corpussync.toml"
 
 if [ -z "${CHANNELS_FILE:-}" ]; then
   _cf=$(toml_val channels_file || true)
@@ -83,7 +88,7 @@ fi
 if [ -z "${PYBIN:-}" ]; then
   _py=$(toml_val pybin || true)
   if [ -n "$_py" ]; then
-    PYBIN="$_py"
+    PYBIN=$(expand_tilde "$_py")
   else
     PYBIN="python3"
   fi
@@ -142,6 +147,7 @@ for entry in "${CHANNELS[@]}"; do
   HANDLE="${rest%%|*}"
   URL="${rest##*|}"
   CAP_DIR="$DATA_DIR/$SOURCE/captions"
+  NO_CAPTIONS="$DATA_DIR/$SOURCE/no-captions.txt"
   mkdir -p "$CAP_DIR"
   echo "-- $SOURCE ($HANDLE) --"
 
@@ -153,9 +159,15 @@ for entry in "${CHANNELS[@]}"; do
   while IFS= read -r vid; do
     [ -z "$vid" ] && continue
     ls "$CAP_DIR/$vid".*.vtt >/dev/null 2>&1 && continue
+    if [ -f "$NO_CAPTIONS" ] && grep -Fqx -- "$vid" "$NO_CAPTIONS"; then
+      continue
+    fi
     [ "$pulled" -ge "$PER_RUN_CAP" ] && break
     yt-dlp ${YT_COOKIES[@]+"${YT_COOKIES[@]}"} --write-auto-subs --sub-langs en --skip-download \
       -o "$CAP_DIR/%(id)s.%(ext)s" "https://youtu.be/$vid" >/dev/null 2>&1 || true
+    if ! ls "$CAP_DIR/$vid".*.vtt >/dev/null 2>&1; then
+      printf '%s\n' "$vid" >> "$NO_CAPTIONS"
+    fi
     pulled=$((pulled + 1))
   done < "$DATA_DIR/$SOURCE/all-ids.txt"
   echo "  pulled up to $pulled new caption files"

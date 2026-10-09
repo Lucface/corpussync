@@ -1,10 +1,14 @@
 """Answer a question from search hits with a local chat model."""
 
+from __future__ import annotations
+
 import sys
+from types import SimpleNamespace
 
 import requests
 
 from corpussync.search import no_match_message, print_hits, print_notices, search
+from corpussync.config import ollama_base_url
 
 _SYSTEM = (
     "Answer the question using only the numbered sources. "
@@ -14,13 +18,13 @@ _SYSTEM = (
 
 class OllamaChat:
     def __init__(self, host: str, port: int):
-        self.base = f"http://{host}:{port}"
+        self.base = ollama_base_url(SimpleNamespace(ollama_host=host, ollama_port=port))
 
     def complete(self, model: str, messages: list[dict]) -> str:
         resp = requests.post(
             f"{self.base}/api/chat",
             json={"model": model, "messages": messages, "stream": False},
-            timeout=120,
+            timeout=300,
         )
         resp.raise_for_status()
         return resp.json()["message"]["content"]
@@ -56,14 +60,15 @@ def _prompt(question: str, result) -> str:
     return "\n".join(lines)
 
 
-def ask(ctx, question: str, corpora: list[str], k: int = 6, model: str | None = None) -> int:
+def ask(ctx, question: str, corpora: list[str], k: int = 6, model: str | None = None,
+        min_score: float | None = None, collections: list[str] | None = None) -> int:
     """Search, then ask the chat model. Returns 2 without calling the model when nothing clears the floor."""
-    result = search(ctx, question, corpora, k=k, mode="hybrid")
+    result = search(ctx, question, corpora, k=k, mode="hybrid", min_score=min_score, collections=collections)
     print_notices(result.notices)
     for corpus in result.missing:
-        print(f"{corpus}-corpus: not found", file=sys.stderr)
+        print(f"{corpus}: not found", file=sys.stderr)
     if not result.results:
-        print(no_match_message(list(corpora)))
+        print(no_match_message(list(corpora) + list(collections or [])))
         return 2
     chosen = model or ctx.settings.answer_model
     messages = [

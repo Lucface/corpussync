@@ -1,5 +1,7 @@
 """Caption cleaning. Timing cues are stripped and never searched."""
 
+from __future__ import annotations
+
 import html
 import re
 

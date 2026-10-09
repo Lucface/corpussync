@@ -1,12 +1,16 @@
-"""Dense, keyword, and hybrid search. Several corpora are fused with RRF."""
+"""Dense, keyword, and hybrid search with a shared relevance gate and ranking."""
 
+from __future__ import annotations
+
+import math
 import re
 import sys
 from dataclasses import dataclass, field
 
 from qdrant_client.models import Fusion, FusionQuery, Prefetch
 
-from corpussync.sparse import sparse_vector
+from corpussync.names import check_name
+from corpussync.sparse import keyword_tokens, sparse_vector
 from corpussync.store import layout_of, resolve_collection
 
 _RRF_K = 60
@@ -24,6 +28,8 @@ class Hit:
     source_file: str
     chunk_index: int
     text: str
+    relevance: float | None
+    keyword_coverage: float
 
 
 @dataclass
@@ -35,9 +41,7 @@ class SearchResult:
 
 
 def no_match_message(corpora: list[str]) -> str:
-    if not corpora:
-        return "no good match in:"
-    return "no good match in: " + ", ".join(corpora)
+    return "no good match in:" + (" " + ", ".join(corpora) if corpora else "")
 
 
 def snippet(text: str, limit: int = 200) -> str:
@@ -55,7 +59,8 @@ def print_notices(notices: list[str]) -> None:
 def print_hits(result: SearchResult) -> None:
     for hit in result.results:
         locator = hit.locator or hit.url
-        print(f"[{hit.n}] {hit.score:.4f}  {hit.corpus} | {hit.title} | {locator}")
+        score = hit.relevance if hit.relevance is not None else hit.keyword_coverage
+        print(f"[{hit.n}] {score:.4f}  {hit.corpus} | {hit.title} | {locator}")
         text = snippet(hit.text)
         if text:
             print(text)
@@ -67,177 +72,153 @@ def print_coverage(corpora: list[str], coverage: dict) -> None:
     print("coverage: " + ", ".join(parts))
 
 
-def _floor(settings, mode: str) -> float:
-    try:
-        return float(settings.min_score.get(mode, 0.0))
-    except (TypeError, ValueError):
-        return 0.0
+def corpus_label(collection: str) -> str:
+    return collection[:-len("-corpus")] if collection.endswith("-corpus") else collection
 
 
-def _threshold(value: float) -> float | None:
-    if value > 0:
-        return value
-    return None
-
-
-def _hits_from_points(points, corpus: str) -> list[Hit]:
-    hits = []
-    for point in points:
-        payload = point.payload or {}
-        hits.append(Hit(
-            n=0,
-            corpus=corpus,
-            score=float(point.score),
-            title=str(payload.get("title") or ""),
-            locator=str(payload.get("locator") or ""),
-            url=str(payload.get("url") or ""),
-            source_file=str(payload.get("source_file") or ""),
-            chunk_index=int(payload.get("chunk_index") or 0),
-            text=str(payload.get("text") or ""),
-        ))
-    return hits
-
-
-def _query_dense(client, collection: str, vector: list[float], using: str | None, limit: int, floor: float):
-    kwargs = {
-        "collection_name": collection,
-        "query": vector,
-        "limit": limit,
-        "with_payload": True,
-    }
-    if using:
-        kwargs["using"] = using
-    threshold = _threshold(floor)
-    if threshold is not None:
-        kwargs["score_threshold"] = threshold
-    response = client.query_points(**kwargs)
-    return response.points
-
-
-def _query_keyword(client, collection: str, query: str, limit: int, floor: float):
-    vector = sparse_vector(query)
-    if not vector.indices:
-        return []
-    kwargs = {
-        "collection_name": collection,
-        "query": vector,
-        "using": "bm25",
-        "limit": limit,
-        "with_payload": True,
-    }
-    threshold = _threshold(floor)
-    if threshold is not None:
-        kwargs["score_threshold"] = threshold
-    response = client.query_points(**kwargs)
-    return response.points
-
-
-def _query_hybrid(client, collection: str, dense: list[float], query: str, limit: int, settings):
-    prefetch_limit = max(limit * 4, 16)
-    prefetches = []
-    dense_kwargs = {"query": dense, "using": "dense", "limit": prefetch_limit}
-    dense_floor = _threshold(_floor(settings, "dense"))
-    if dense_floor is not None:
-        dense_kwargs["score_threshold"] = dense_floor
-    prefetches.append(Prefetch(**dense_kwargs))
-    sparse = sparse_vector(query)
-    if sparse.indices:
-        sparse_kwargs = {"query": sparse, "using": "bm25", "limit": prefetch_limit}
-        keyword_floor = _threshold(_floor(settings, "keyword"))
-        if keyword_floor is not None:
-            sparse_kwargs["score_threshold"] = keyword_floor
-        prefetches.append(Prefetch(**sparse_kwargs))
-    kwargs = {
-        "collection_name": collection,
-        "prefetch": prefetches,
-        "query": FusionQuery(fusion=Fusion.RRF),
-        "limit": limit,
-        "with_payload": True,
-    }
-    hybrid_floor = _threshold(_floor(settings, "hybrid"))
-    if hybrid_floor is not None:
-        kwargs["score_threshold"] = hybrid_floor
-    response = client.query_points(**kwargs)
-    return response.points
-
-
-def _search_one(ctx, query: str, corpus: str, k: int, mode: str) -> tuple[list[Hit], str | None, bool]:
-    collection = resolve_collection(ctx.client, corpus)
-    if collection is None:
-        return [], None, False
-    layout = layout_of(ctx.client, collection)
-    notice = None
-    effective = mode
-    using = None
-    if layout == "unnamed":
-        using = None
-        if mode != "dense":
-            notice = f"{corpus}: --mode hybrid needs a fresh corpus (remove then ingest again)"
-            effective = "dense"
-    elif layout == "dense-named":
-        using = "dense"
-        if mode != "dense":
-            notice = f"{corpus}: --mode hybrid needs a fresh corpus (remove then ingest again)"
-            effective = "dense"
-    dense = ctx.embedder.embed_query(query)
-    if effective == "keyword" and layout == "hybrid":
-        points = _query_keyword(ctx.client, collection, query, k, _floor(ctx.settings, "keyword"))
-    elif effective == "hybrid" and layout == "hybrid":
-        points = _query_hybrid(ctx.client, collection, dense, query, k, ctx.settings)
-    else:
-        points = _query_dense(
-            ctx.client,
-            collection,
-            dense,
-            using if layout != "hybrid" else "dense",
-            k,
-            _floor(ctx.settings, "dense"),
-        )
-    hits = _hits_from_points(points, corpus)
-    floor = _floor(ctx.settings, effective if layout == "hybrid" else "dense")
-    if floor > 0:
-        hits = [hit for hit in hits if hit.score >= floor]
-    return hits, notice, True
-
-
-def _fuse(groups: list[tuple[str, list[Hit]]], k: int) -> list[Hit]:
-    if len(groups) <= 1:
-        hits = groups[0][1] if groups else []
-        return hits[:k]
-    scored: dict[tuple, float] = {}
-    chosen: dict[tuple, Hit] = {}
-    for _corpus, hits in groups:
-        for rank, hit in enumerate(hits, start=1):
-            key = (hit.corpus, hit.source_file, hit.chunk_index)
-            scored[key] = scored.get(key, 0.0) + 1.0 / (_RRF_K + rank)
-            if key not in chosen:
-                chosen[key] = hit
-    ordered = sorted(scored.items(), key=lambda item: (-item[1], item[0]))
-    merged = []
-    for key, score in ordered[:k]:
-        hit = chosen[key]
-        hit.score = score
-        merged.append(hit)
-    return merged
-
-
-def search(ctx, query: str, corpora: list[str], k: int = 8, mode: str = "hybrid") -> SearchResult:
-    if mode not in _MODES:
-        raise ValueError(f"unknown search mode: {mode}")
-    groups = []
-    notices = []
+def select_collections(ctx, corpora, collections=None):
+    for name in corpora:
+        check_name(name, "corpus")
+    selected = []
     missing = []
     for corpus in corpora:
-        hits, notice, found = _search_one(ctx, query, corpus, k, mode)
-        if notice:
-            notices.append(notice)
-        if not found:
+        name = resolve_collection(ctx, corpus)
+        if name is None:
             missing.append(corpus)
-        groups.append((corpus, hits))
-    merged = _fuse(groups, k)
-    for index, hit in enumerate(merged, start=1):
-        hit.n = index
-    coverage = {corpus: 0 for corpus in corpora}
-    for hit in merged:
-        coverage[hit.corpus] = coverage.get(hit.corpus, 0) + 1
-    return SearchResult(results=merged, coverage=coverage, notices=notices, missing=missing)
+        elif name not in selected:
+            selected.append(name)
+    for name in collections or []:
+        if name not in ctx.collections:
+            if name not in missing:
+                missing.append(name)
+        elif name not in selected:
+            selected.append(name)
+    return selected, missing
+
+
+def _cosine(query, stored) -> float:
+    if not stored or len(query) != len(stored):
+        return 0.0
+    norm = math.sqrt(sum(x * x for x in query) * sum(x * x for x in stored))
+    return sum(x * y for x, y in zip(query, stored)) / norm if norm else 0.0
+
+
+def _tie(hit):
+    return hit.corpus, hit.source_file, hit.chunk_index
+
+
+def search(ctx, query: str, corpora: list[str], k: int = 8, mode: str = "hybrid",
+           min_score: float | None = None, collections: list[str] | None = None) -> SearchResult:
+    if mode not in _MODES:
+        raise ValueError(f"unknown search mode: {mode}")
+    selected, missing = select_collections(ctx, corpora, collections)
+    result = SearchResult(missing=missing)
+    result.coverage = {corpus_label(name): 0 for name in selected}
+    result.coverage.update({name: 0 for name in missing})
+    dense_floor = min_score if min_score is not None else ctx.settings.min_score.get("dense", 0.65)
+    keyword_floor = ctx.settings.min_score.get("keyword", 1.0)
+    query_tokens = set(keyword_tokens(query))
+    sparse = sparse_vector(query)
+    vectors = {}
+    vector_errors = {}
+    candidates = []
+    limit = max(4 * k, 20)
+    for collection in selected:
+        corpus = corpus_label(collection)
+        try:
+            layout = layout_of(ctx.client, collection, ctx.settings.embed_dim)
+            if layout == "foreign":
+                result.notices.append(f"{corpus}: skipped (not a corpussync corpus)")
+                continue
+            if mode == "keyword" and layout != "hybrid":
+                result.notices.append(f"{corpus}: keyword mode needs a fresh corpus (remove then ingest again)")
+                continue
+            prefixed = layout != "unnamed"
+            dense = None
+            kwargs = dict(collection_name=collection, limit=limit, with_payload=True)
+            if mode != "keyword":
+                if prefixed in vector_errors:
+                    raise vector_errors[prefixed]
+                if prefixed not in vectors:
+                    try:
+                        vectors[prefixed] = ctx.embedder.embed_query(query, prefixed=prefixed)
+                    except Exception as exc:
+                        vector_errors[prefixed] = exc
+                        raise
+                dense = vectors[prefixed]
+                kwargs["with_vectors"] = ["dense"] if prefixed else True
+            if mode == "keyword":
+                if not sparse.indices:
+                    continue
+                kwargs.update(query=sparse, using="bm25")
+            elif mode == "hybrid" and layout == "hybrid":
+                kwargs.update(
+                    prefetch=[
+                        Prefetch(query=dense, using="dense", limit=limit),
+                        Prefetch(query=sparse, using="bm25", limit=limit),
+                    ],
+                    query=FusionQuery(fusion=Fusion.RRF),
+                )
+            else:
+                if mode == "hybrid":
+                    result.notices.append(f"{corpus}: --mode hybrid needs a fresh corpus (remove then ingest again)")
+                kwargs["query"] = dense
+                if prefixed:
+                    kwargs["using"] = "dense"
+            points = ctx.client.query_points(**kwargs).points
+            group = []
+            for rank, point in enumerate(points, 1):
+                payload = point.payload or {}
+                text = str(payload.get("text") or "")
+                coverage = len(query_tokens & set(keyword_tokens(text))) / len(query_tokens) if query_tokens else 0.0
+                relevance = None
+                if dense is not None:
+                    stored = point.vector
+                    if isinstance(stored, dict):
+                        stored = stored.get("dense")
+                    relevance = _cosine(dense, stored)
+                keep = (
+                    coverage > 0 if mode == "keyword" else
+                    relevance >= dense_floor or (mode == "hybrid" and bool(query_tokens) and coverage >= keyword_floor)
+                )
+                if not keep:
+                    continue
+                hit = Hit(
+                    n=0, corpus=corpus, score=0.0,
+                    title=str(payload.get("title") or ""),
+                    locator=str(payload.get("locator") or ""),
+                    url=str(payload.get("url") or ""),
+                    source_file=str(payload.get("source_file") or ""),
+                    chunk_index=int(payload.get("chunk_index") or 0), text=text,
+                    relevance=relevance, keyword_coverage=coverage,
+                )
+                group.append((hit, rank))
+            candidates.extend(group)
+        except Exception as exc:
+            result.notices.append(f"{corpus}: skipped ({str(exc)[:80]})")
+    if mode == "keyword":
+        ordered = sorted(candidates, key=lambda item: (-item[0].keyword_coverage, item[1], _tie(item[0])))
+        hits = [hit for hit, _rank in ordered]
+        for hit in hits:
+            hit.score = hit.keyword_coverage
+    else:
+        hits = sorted((hit for hit, _rank in candidates), key=lambda hit: (-hit.relevance, _tie(hit)))
+        if mode == "hybrid":
+            keyword_hits = sorted(
+                (hit for hit in hits if hit.keyword_coverage >= keyword_floor),
+                key=lambda hit: (-hit.keyword_coverage, -hit.relevance, _tie(hit)),
+            )
+            keyword_ranks = {id(hit): rank for rank, hit in enumerate(keyword_hits, 1)}
+            for rank, hit in enumerate(hits, 1):
+                hit.score = 1.0 / (_RRF_K + rank)
+                if id(hit) in keyword_ranks:
+                    hit.score += 1.0 / (_RRF_K + keyword_ranks[id(hit)])
+            hits.sort(key=lambda hit: (-hit.score, _tie(hit)))
+        else:
+            for hit in hits:
+                hit.score = hit.relevance
+    result.results = hits[:k]
+    for n, hit in enumerate(result.results, 1):
+        hit.n = n
+        result.coverage[hit.corpus] += 1
+    return result

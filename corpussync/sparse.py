@@ -1,5 +1,7 @@
 """Sparse keyword vectors. Term ids are the first 4 bytes of blake2b."""
 
+from __future__ import annotations
+
 import hashlib
 import math
 import re
@@ -18,12 +20,9 @@ STOPWORDS = frozenset(
     """.split()
 )
 
-_SPLIT = re.compile(r"[^0-9A-Za-z]+")
-
-
 def split_tokens(text: str) -> list[str]:
     """Lowercase alphanumeric tokens, including stopwords and single characters."""
-    return [tok for tok in _SPLIT.split(text.lower()) if tok]
+    return re.findall(r"[^\W_]+", text.lower())
 
 
 def keyword_tokens(text: str) -> list[str]:

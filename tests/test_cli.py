@@ -1,5 +1,7 @@
 """source: the offline CLI covers init, ingest, search, ask, stats, list, and remove."""
 
+from __future__ import annotations
+
 import json
 import sys
 
@@ -23,7 +25,7 @@ def test_help_lists_commands():
 
 
 def test_cli_offline_flow(tmp_path):
-    """source: init, ingest, search --json, ask, stats, list, and remove --yes run offline."""
+    """source: defects 20 and 14, init uses the trusted home and JSON exposes relevance."""
     work = tmp_path / "work"
     work.mkdir()
     home = tmp_path / "home"
@@ -35,7 +37,7 @@ def test_cli_offline_flow(tmp_path):
 
     created = run_cli(["init"], home, work)
     assert created.returncode == 0, created.stderr
-    toml_path = work / "corpussync.toml"
+    toml_path = home / "corpussync.toml"
     text = toml_path.read_text(encoding="utf-8")
     assert "# home = " in text
     assert "# answer_model = " in text
@@ -66,6 +68,7 @@ def test_cli_offline_flow(tmp_path):
     hit = payload["results"][0]
     assert set(hit) == {
         "n", "corpus", "score", "title", "locator", "url", "source_file", "chunk_index", "text",
+        "relevance", "keyword_coverage",
     }
     assert hit["corpus"] == "notes"
     assert hit["title"] == "Widget notes"
@@ -102,7 +105,7 @@ def test_cli_offline_flow(tmp_path):
 
 
 def test_env_overrides_toml(tmp_path, monkeypatch):
-    """source: environment overrides corpussync.toml, which overrides defaults."""
+    """source: defect 20, explicit config is read with environment taking precedence."""
     wanted = tmp_path / "from-toml"
     cfg = tmp_path / "corpussync.toml"
     cfg.write_text(
@@ -112,7 +115,7 @@ def test_env_overrides_toml(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("CORPUSSYNC_HOME", raising=False)
     monkeypatch.setenv("CORPUSSYNC_EMBED_MODEL", "from-env")
-    settings = load_settings()
+    settings = load_settings(str(cfg))
     assert settings.embed_model == "from-env"
     assert settings.home == wanted
     assert settings.answer_model == "llama3.2"
@@ -130,3 +133,58 @@ def test_minimal_toml_reader_parses_tables():
         import tomllib
 
         assert tomllib.loads(sample)["search"]["min_score"]["dense"] == 0.5
+
+
+def test_remove_missing_never_deletes(ctx, monkeypatch, capsys):
+    """source: defect 1, removing an absent collection returns 1 without calling delete."""
+    from corpussync.cli import cmd_remove
+
+    called = []
+    monkeypatch.setattr(ctx.client, "delete_collection", lambda **kwargs: called.append(kwargs))
+    assert cmd_remove(ctx, None, True, "missing") == 1
+    assert capsys.readouterr().out == "missing: not found\n"
+    assert called == []
+
+
+def test_exact_stats_and_remove_scope(ctx, tmp_path, capsys):
+    """source: defects 3 and 10, exact selection counts or removes only the chosen collection and store rows."""
+    from corpussync.cli import cmd_remove, cmd_stats
+    from corpussync.ingest import ingest_document
+    from corpussync.state import save_hash, saved_hash, store_identity
+
+    path = str(tmp_path / "note")
+    for collection in ("notes", "notes-corpus"):
+        ctx.collection_override = collection
+        ingest_document(ctx, text="five words make this note", source_file=path,
+                        corpus="notes", title=collection, locator="note")
+    ctx.collection_override = None
+    identity = store_identity(ctx.settings)
+    save_hash(ctx.db, "other-store", path, "other-digest", "", "notes", 1)
+    capsys.readouterr()
+    assert cmd_stats(ctx, None, ["notes", "notes-corpus"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["notes: 1 points", "notes-corpus: 1 points"]
+    assert cmd_remove(ctx, None, True, "notes") == 0
+    assert "notes-corpus" in ctx.collections
+    assert saved_hash(ctx.db, identity, "notes", path) is None
+    assert saved_hash(ctx.db, identity, "notes-corpus", path) is not None
+    assert saved_hash(ctx.db, "other-store", "notes", path) == ("other-digest",)
+
+
+def test_remote_notices_precede_first_store_call(ctx, monkeypatch, capsys):
+    """source: defect 6, CLI emits destination notices before --all contacts a remote store."""
+    from types import SimpleNamespace
+    from corpussync.cli import main
+
+    class Store:
+        def get_collections(self):
+            assert capsys.readouterr().err.splitlines() == [
+                "note: document text goes to https://ollama.example (Ollama)",
+                "note: document text goes to https://qdrant.example (Qdrant)",
+            ]
+            return SimpleNamespace(collections=[])
+
+    ctx.client = Store()
+    ctx.settings.ollama_host = "https://ollama.example"
+    ctx.settings.qdrant_url = "https://qdrant.example"
+    monkeypatch.setattr("corpussync.cli.load_context", lambda *args: ctx)
+    assert main(["search", "question", "--all"]) == 2

@@ -1,5 +1,7 @@
 """source: clean_vtt and clean_srt strip timing and collapse caption text."""
 
+from __future__ import annotations
+
 from pathlib import Path
 
 from corpussync.vtt import clean_srt, clean_vtt

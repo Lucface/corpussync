@@ -1,5 +1,7 @@
 """source: chunk keeps the 0.1 window and overlap, and drops tiny texts."""
 
+from __future__ import annotations
+
 from corpussync.chunking import chunk
 
 

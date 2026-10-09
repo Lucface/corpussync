@@ -1,5 +1,7 @@
 """Read supported files into plain text. Missing pdf/docx extras skip the file."""
 
+from __future__ import annotations
+
 import re
 from html.parser import HTMLParser
 from pathlib import Path
@@ -96,13 +98,24 @@ def _pdf_text(path: Path) -> tuple[str, str | None] | None:
 def _docx_text(path: Path) -> tuple[str, str | None] | None:
     try:
         from docx import Document
+        from docx.table import Table
     except ImportError:
         _missing_extra(path, "docx")
         return None
     document = Document(str(path))
     title = None
     parts = []
-    for para in document.paragraphs:
+    def paragraphs(items):
+        for item in items:
+            if isinstance(item, Table):
+                for row in item.rows:
+                    for cell in row.cells:
+                        yield from cell.paragraphs
+                        yield from paragraphs(cell.tables)
+            else:
+                yield item
+
+    for para in paragraphs(document.iter_inner_content()):
         style = para.style.name if para.style is not None else ""
         text = para.text.strip()
         if text and title is None and style.startswith("Heading"):

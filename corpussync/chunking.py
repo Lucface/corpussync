@@ -1,5 +1,7 @@
 """Word-window chunking. Behavior matches the 0.1 chunk() function."""
 
+from __future__ import annotations
+
 
 def chunk(text: str, max_tokens: int = 512, overlap: int = 64) -> list[str]:
     words = text.split()

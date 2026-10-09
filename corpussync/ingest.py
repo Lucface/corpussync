@@ -1,5 +1,7 @@
 """Ingest files and YouTube captions. One core writes every point."""
 
+from __future__ import annotations
+
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,8 +10,9 @@ from qdrant_client.models import FieldCondition, Filter, MatchValue, PointStruct
 
 from corpussync.chunking import chunk
 from corpussync.extract import SUPPORTED_EXTENSIONS, extract_file
+from corpussync.names import check_name
 from corpussync.sparse import sparse_vector
-from corpussync.state import content_hash, save_hash, saved_hash
+from corpussync.state import content_hash, save_hash, saved_hash, delete_collection_rows, store_identity
 from corpussync.store import ensure_collection, log, make_point_id, retry
 from corpussync.vtt import clean_vtt
 
@@ -85,6 +88,15 @@ def _vector_for(layout: str, dense: list[float], text: str):
     return dense
 
 
+def _ensure_collection(ctx, collection: str) -> str:
+    layout, created = ensure_collection(ctx.client, collection, ctx.settings.embed_dim, ctx.collections)
+    if created:
+        delete_collection_rows(ctx.db, store_identity(ctx.settings), collection)
+    if layout == "foreign":
+        raise ValueError(f"{collection}: not a corpussync corpus")
+    return layout
+
+
 def ingest_document(
     ctx,
     *,
@@ -95,26 +107,30 @@ def ingest_document(
     locator,
     extra_payload=None,
     force=False,
+    digest: str | None = None,
 ) -> int:
     """Write one document. Returns chunks written, or 0 when the content hash is unchanged."""
     text = text or ""
-    digest = content_hash(text)
-    row = saved_hash(ctx.db, source_file)
+    digest = content_hash(text) if digest is None else digest
+    collection = ctx.collection_name(corpus)
+    layout = _ensure_collection(ctx, collection)
+    identity = store_identity(ctx.settings)
+    row = saved_hash(ctx.db, identity, collection, source_file)
     if row and row[0] == digest and not force:
         return 0
 
     chunks = chunk(text)
-    collection = ctx.collection_name(corpus)
-    layout = ensure_collection(ctx.client, collection, ctx.settings.embed_dim)
+    if not chunks and text.strip() and not extra_payload:
+        chunks = [" ".join(text.split())]
     now = datetime.now(timezone.utc).isoformat()
 
     if not chunks:
         if row:
             _delete_stale(ctx, collection, source_file, 0)
-            save_hash(ctx.db, source_file, digest, now, collection, 0)
+            save_hash(ctx.db, identity, source_file, digest, now, collection, 0)
         return 0
 
-    vectors = ctx.embedder.embed_documents(chunks)
+    vectors = ctx.embedder.embed_documents(chunks, prefixed=layout != "unnamed")
     if len(vectors) != len(chunks):
         raise RuntimeError(
             f"embed count mismatch for {source_file}: {len(vectors)} vectors != {len(chunks)} chunks"
@@ -157,18 +173,21 @@ def ingest_document(
             f"upsert {source_file}",
         )
     _delete_stale(ctx, collection, source_file, total)
-    save_hash(ctx.db, source_file, digest, now, collection, total)
+    save_hash(ctx.db, identity, source_file, digest, now, collection, total)
     return total
 
 
-def ingest_paths(ctx, paths: list[Path], corpus: str, force: bool = False) -> int:
+def ingest_paths(ctx, paths: list[Path], corpus: str, force: bool = False, keep_missing: bool = False) -> int:
+    check_name(corpus, "corpus")
+    ctx.begin_run()
     files = []
-    missing = False
+    roots = []
+    failed = 0
     for raw in paths:
         path = raw.expanduser()
         if not path.exists():
             print(f"not found: {path}")
-            missing = True
+            failed += 1
             continue
         if path.is_file():
             if path.name.startswith("."):
@@ -180,7 +199,8 @@ def ingest_paths(ctx, paths: list[Path], corpus: str, force: bool = False) -> in
             continue
         if path.name.startswith("."):
             continue
-        for dirpath, dirnames, filenames in os.walk(path):
+        scan_errors = []
+        for dirpath, dirnames, filenames in os.walk(path, onerror=scan_errors.append):
             dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
             for name in sorted(filenames):
                 if name.startswith("."):
@@ -188,6 +208,12 @@ def ingest_paths(ctx, paths: list[Path], corpus: str, force: bool = False) -> in
                 file_path = Path(dirpath) / name
                 if file_path.suffix.lower() in SUPPORTED_EXTENSIONS:
                     files.append((file_path, path))
+        if scan_errors:
+            for exc in scan_errors:
+                log(f"FAILED scan {path}: {exc}")
+            failed += len(scan_errors)
+        else:
+            roots.append(path.resolve())
     total_files = 0
     total_chunks = 0
     for file_path, root in files:
@@ -195,8 +221,10 @@ def ingest_paths(ctx, paths: list[Path], corpus: str, force: bool = False) -> in
             extracted = extract_file(file_path)
         except Exception as exc:
             log(f"FAILED {file_path.name}: {exc}")
+            failed += 1
             continue
         if extracted is None:
+            failed += 1
             continue
         text, title = extracted
         if not title:
@@ -219,14 +247,40 @@ def ingest_paths(ctx, paths: list[Path], corpus: str, force: bool = False) -> in
             )
         except Exception as exc:
             log(f"FAILED {file_path.name}: {exc}")
+            failed += 1
             continue
         if written:
             total_files += 1
             total_chunks += written
             log(f"ingested {locator} -> {written} chunks")
     collection = ctx.collection_name(corpus)
-    log(f"DONE: {total_files} files, {total_chunks} chunks -> {collection}")
-    return 1 if missing else 0
+    removed = 0
+    if not keep_missing:
+        found = {str(path.resolve()) for path, _root in files}
+        identity = store_identity(ctx.settings)
+        rows = ctx.db.execute(
+            "SELECT path FROM ingest_state WHERE store=? AND collection=?", (identity, collection),
+        ).fetchall()
+        for (source_file,) in rows:
+            root = next((root for root in roots if source_file.startswith(str(root) + os.sep)), None)
+            if root is None or source_file in found:
+                continue
+            try:
+                if collection in ctx.collections:
+                    selector = Filter(must=[FieldCondition(key="source_file", match=MatchValue(value=source_file))])
+                    ctx.client.delete(collection_name=collection, points_selector=selector)
+                ctx.db.execute(
+                    "DELETE FROM ingest_state WHERE store=? AND collection=? AND path=?",
+                    (identity, collection, source_file),
+                )
+                ctx.db.commit()
+                removed += 1
+                log(f"removed {Path(source_file).relative_to(root).as_posix()} (no longer on disk)")
+            except Exception as exc:
+                failed += 1
+                log(f"FAILED removing {source_file}: {exc}")
+    log(f"DONE: {total_files} files, {total_chunks} chunks, {removed} removed, {failed} failed -> {collection}")
+    return 1 if failed else 0
 
 
 def ingest_youtube(
@@ -238,16 +292,19 @@ def ingest_youtube(
     quality: str,
     force: bool,
 ) -> int:
-    if not captions_dir.exists():
-        log(f"ERROR: captions dir not found: {captions_dir}")
-        return 0
+    check_name(source, "source")
+    ctx.begin_run()
     collection = ctx.collection_name(source)
-    ensure_collection(ctx.client, collection, ctx.settings.embed_dim)
+    if not captions_dir.is_dir():
+        log(f"ERROR: captions dir not found: {captions_dir}")
+        log(f"DONE: 0 files, 0 chunks, 1 failed -> {collection}")
+        return 1
     titles = load_titles(titles_path)
     files = _dedupe_by_video(sorted(captions_dir.glob("*.vtt")))
     log(f"found {len(files)} caption files; {len(titles)} titles loaded -> {collection}")
     total_files = 0
     total_chunks = 0
+    failed = 0
     for path in files:
         try:
             raw = path.read_text(encoding="utf-8", errors="replace")
@@ -283,13 +340,15 @@ def ingest_youtube(
                 locator="",
                 extra_payload=extra,
                 force=force,
+                digest=content_hash(raw),
             )
         except Exception as exc:
             log(f"FAILED {path.name}: {exc}")
+            failed += 1
             continue
         if written:
             total_files += 1
             total_chunks += written
             log(f"ingested {video_id} -> {written} chunks [{author}]")
-    log(f"DONE: {total_files} files, {total_chunks} chunks -> {collection}")
-    return 0
+    log(f"DONE: {total_files} files, {total_chunks} chunks, {failed} failed -> {collection}")
+    return 1 if failed else 0

@@ -1,9 +1,13 @@
 """Settings. Precedence: command-line flags, environment, corpussync.toml, defaults."""
 
+from __future__ import annotations
+
 import os
+import ipaddress
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 DEFAULT_HOME = "~/.corpussync"
 DEFAULT_QDRANT_PORT = 6333
@@ -14,7 +18,7 @@ DEFAULT_EMBED_DIM = 768
 DEFAULT_EMBEDDER = "ollama"
 DEFAULT_CHAT = "ollama"
 DEFAULT_ANSWER_MODEL = "llama3.2"
-DEFAULT_MIN_SCORE = {"dense": 0.2, "keyword": 0.05, "hybrid": 0.0}
+DEFAULT_MIN_SCORE = {"dense": 0.65, "keyword": 1.0}
 DEFAULT_DATA_DIR = "~/.corpussync/channels"
 DEFAULT_CHANNELS_FILE = "channels.txt"
 DEFAULT_PER_RUN_CAP = 250
@@ -27,7 +31,7 @@ def config_template() -> str:
 # Uncomment a line to override its default.
 # Precedence: command-line flags, then environment variables, then this file, then defaults.
 # Root keys stay above the tables. Uncomment a key where it sits.
-# On Python 3.10 this file is read by a minimal parser (comments, tables, strings, numbers, booleans).
+# On Python 3.9 and 3.10 this file uses a minimal parser (comments, tables, strings, numbers, booleans).
 # Python 3.11 and newer use tomllib.
 
 # home = "{DEFAULT_HOME}"
@@ -61,12 +65,11 @@ def config_template() -> str:
 [search.min_score]
 # dense = {scores["dense"]}
 # keyword = {scores["keyword"]}
-# hybrid = {scores["hybrid"]}
 """
 
 
 def loads_toml_minimal(text: str) -> dict:
-    """Small TOML reader for the keys this project writes. Used on Python 3.10."""
+    """Small TOML reader for the keys this project writes. Used on Python 3.9 and 3.10."""
     root: dict = {}
     current = root
 
@@ -260,9 +263,6 @@ def find_config(explicit: str | None, home: Path) -> Path | None:
         if not path.is_file():
             raise SystemExit(f"config not found: {path}")
         return path
-    cwd = Path.cwd() / "corpussync.toml"
-    if cwd.is_file():
-        return cwd
     home_cfg = home / "corpussync.toml"
     if home_cfg.is_file():
         return home_cfg
@@ -363,11 +363,29 @@ class Context:
         self.collection_override: str | None = None
         self._client = None
         self._db = None
+        self._collections = None
+        self._selection_notices = set()
 
     def collection_name(self, corpus: str) -> str:
+        from corpussync.names import check_name
+        from corpussync.store import resolve_collection
+
+        check_name(corpus, "corpus")
         if self.collection_override:
-            return self.collection_override
-        return f"{corpus}-corpus"
+            return check_name(self.collection_override, "collection")
+        return resolve_collection(self, corpus) or f"{corpus}-corpus"
+
+    def begin_run(self) -> None:
+        self._collections = None
+        self._selection_notices.clear()
+
+    @property
+    def collections(self) -> set[str]:
+        if self._collections is None:
+            from corpussync.store import collection_names
+
+            self._collections = collection_names(self.client)
+        return self._collections
 
     @property
     def client(self):
@@ -380,16 +398,20 @@ class Context:
     @client.setter
     def client(self, value) -> None:
         self._client = value
+        self._collections = None
 
     @property
     def db(self):
         if self._db is None:
-            from corpussync.state import connect
+            from corpussync.state import connect, import_legacy_state
 
+            private_directory(self.settings.home, tighten=True)
             self._db = connect(self.settings.state_path)
+            import_legacy_state(self._db, self.settings)
         return self._db
 
     def close(self) -> None:
+        self.begin_run()
         if self._client is not None:
             close = getattr(self._client, "close", None)
             if close:
@@ -406,3 +428,51 @@ def load_context(config_path: str | None = None) -> Context:
 
     settings = load_settings(config_path)
     return Context(settings, build_embedder(settings), build_chat(settings))
+
+
+def private_directory(path: Path, tighten: bool = False) -> None:
+    """Create private directories without changing permissions on unrelated parents."""
+    if not path.exists():
+        if not path.parent.exists():
+            private_directory(path.parent)
+        path.mkdir(mode=0o700, exist_ok=True)
+    if tighten and path.stat().st_mode & 0o077:
+        path.chmod(0o700)
+
+
+def ollama_base_url(settings) -> str:
+    host = settings.ollama_host.rstrip("/")
+    if "://" in host:
+        return host
+    parsed = urlsplit("//" + host)
+    if parsed.port is not None:
+        return "http://" + host
+    return f"http://{host}:{settings.ollama_port}"
+
+
+def is_local_host(host: str) -> bool:
+    if host.startswith(("/", "~", "./", "../", "file:")):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        pass
+    parsed = urlsplit(host if "://" in host else "//" + host)
+    name = parsed.hostname or ""
+    if name.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+def privacy_notices(settings) -> None:
+    hosts = [(ollama_base_url(settings), "Ollama")]
+    if settings.qdrant_url:
+        hosts.append((settings.qdrant_url, "Qdrant"))
+    elif settings.qdrant_host:
+        hosts.append((f"{settings.qdrant_host}:{settings.qdrant_port}", "Qdrant"))
+    for host, which in hosts:
+        if not is_local_host(host):
+            print(f"note: document text goes to {host} ({which})", file=sys.stderr)
