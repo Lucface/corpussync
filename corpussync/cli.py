@@ -12,6 +12,10 @@ from pathlib import Path
 
 import requests
 
+from corpussync.deps import require_qdrant_client
+
+require_qdrant_client()
+
 from corpussync.answer import ask
 from corpussync.config import DEFAULT_HOME, config_template, load_context, ollama_base_url, private_home, privacy_notices
 from corpussync.names import InvalidName, check_name
@@ -204,8 +208,8 @@ def cmd_doctor(ctx) -> int:
     settings = ctx.settings
     base = ollama_base_url(settings)
     if not settings.using_server() and legacy_state_path(settings) is not None:
-        if legacy_server_answers(requests.get):
-            print(f"note: a Qdrant server answers at {legacy_address()}, where 0.1 kept its corpora; set QDRANT_URL to search them")
+        if legacy_server_answers(settings, requests.get):
+            print(f"note: a Qdrant server answers at {legacy_address(settings)}, where 0.1 kept its corpora; set QDRANT_URL to search them")
     try:
         resp = requests.get(f"{base}/api/tags", timeout=5)
         resp.raise_for_status()
@@ -369,7 +373,7 @@ def main_compat(argv=None, probe=None) -> int:
         def compat_probe(url, timeout):
             nonlocal noted
             if not args.stats:
-                privacy_notices(replace(ctx.settings, qdrant_url=legacy_address()))
+                privacy_notices(replace(ctx.settings, qdrant_url=legacy_address(ctx.settings)))
                 noted = True
             return (probe or requests.get)(url, timeout=timeout)
 
@@ -382,8 +386,7 @@ def main_compat(argv=None, probe=None) -> int:
             return stats_collection(ctx, collection)
         if not args.captions:
             ap.error("--captions is required unless --stats")
-        if args.collection:
-            ctx.collection_override = args.collection
+        ctx.collection_override = args.collection or f"{args.source}-corpus"
         return ingest_youtube(
             ctx,
             Path(args.captions).expanduser(),

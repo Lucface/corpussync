@@ -10,6 +10,37 @@ from corpussync.config import is_local_host, load_settings, ollama_base_url, pri
 from tests.conftest import run_cli
 
 
+def test_settings_read_toml_numbers_dotted_keys_and_comments(home):
+    """source: valid TOML underscores, exponent floats, dotted keys and inline comments must load on every supported Python."""
+    config = home / "corpussync.toml"
+    config.write_text(
+        'search.min_score.dense = 6.5e-1\n'
+        'per_run_cap = 1_000 # caption limit\n'
+        '[qdrant]\nport = 6_333\n'
+    )
+    settings = load_settings(str(config))
+    assert settings.qdrant_port == 6333
+    assert settings.min_score["dense"] == 0.65
+    assert settings.per_run_cap == 1000
+
+
+def test_missing_tomli_on_older_python_has_actionable_error(home, monkeypatch):
+    """source: Python 3.9 and 3.10 need an actionable error only when reading a config without tomli."""
+    from corpussync import config
+    from tests.test_extract import _block_import
+
+    monkeypatch.setattr(config, "sys", SimpleNamespace(version_info=(3, 9)))
+    _block_import(monkeypatch, "tomli")
+    assert load_settings().qdrant_port == 6333
+    path = home / "corpussync.toml"
+    path.write_text("per_run_cap = 10\n")
+    with pytest.raises(SystemExit) as exc:
+        load_settings(str(path))
+    assert str(exc.value) == (
+        f"corpussync needs tomli on Python 3.9 and 3.10 to read {path}. Run: pip install tomli"
+    )
+
+
 def test_untrusted_cwd_is_ignored(home, tmp_path):
     """source: defect 20, cwd config cannot redirect the embedder or store."""
     (tmp_path / "corpussync.toml").write_text('[ollama]\nhost="untrusted.example"\n[qdrant]\nhost="untrusted.example"\n')

@@ -130,7 +130,12 @@ def ingest_document(
             save_hash(ctx.db, identity, source_file, digest, now, collection, 0)
         return 0
 
-    vectors = ctx.embedder.embed_documents(chunks, prefixed=layout != "unnamed")
+    embedding_texts = chunks
+    if layout == "unnamed" and extra_payload and extra_payload.get("doc_type") == "talk":
+        channel = extra_payload.get("channel", "")
+        author = extra_payload.get("author", "")
+        embedding_texts = [f"[talk] [{channel}] [{author}]: {piece}" for piece in chunks]
+    vectors = ctx.embedder.embed_documents(embedding_texts, prefixed=layout != "unnamed")
     if len(vectors) != len(chunks):
         raise RuntimeError(
             f"embed count mismatch for {source_file}: {len(vectors)} vectors != {len(chunks)} chunks"
@@ -190,14 +195,10 @@ def ingest_paths(ctx, paths: list[Path], corpus: str, force: bool = False, keep_
             failed += 1
             continue
         if path.is_file():
-            if path.name.startswith("."):
-                continue
             if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
                 print(f"skip {path}: unsupported file type")
                 continue
             files.append((path, path.parent))
-            continue
-        if path.name.startswith("."):
             continue
         scan_errors = []
         for dirpath, dirnames, filenames in os.walk(path, onerror=scan_errors.append):
@@ -260,14 +261,13 @@ def ingest_paths(ctx, paths: list[Path], corpus: str, force: bool = False, keep_
     collection = ctx.collection_name(corpus)
     removed = 0
     if not keep_missing:
-        found = {str(path.resolve()) for path, _root in files}
         identity = store_identity(ctx.settings)
         rows = ctx.db.execute(
             "SELECT path FROM ingest_state WHERE store=? AND collection=?", (identity, collection),
         ).fetchall()
         for (source_file,) in rows:
             root = next((root for root in roots if source_file.startswith(str(root) + os.sep)), None)
-            if root is None or source_file in found:
+            if root is None or os.path.exists(source_file):
                 continue
             try:
                 if collection in ctx.collections:

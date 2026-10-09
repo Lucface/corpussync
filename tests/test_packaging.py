@@ -9,9 +9,8 @@ from tests.conftest import REPO
 
 
 def test_setuptools_reads_package_metadata():
-    """source: 2026-10-08, setuptools read the version from the root shim and pip install -e . failed"""
-    pytest.importorskip("setuptools")
-    from setuptools.config.setupcfg import read_configuration
+    """source: setuptools read the version from the root compatibility shim, and pip install -e . failed"""
+    read_configuration = pytest.importorskip("setuptools.config.setupcfg").read_configuration
 
     config = read_configuration(str(REPO / "setup.cfg"))
     assert config["metadata"]["version"] == corpussync.__version__

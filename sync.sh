@@ -85,6 +85,13 @@ if [ -z "${PER_RUN_CAP:-}" ]; then
   fi
 fi
 
+CAP_RE='^[0-9]+(_[0-9]+)*$'
+if [[ ! $PER_RUN_CAP =~ $CAP_RE ]]; then
+  echo "per_run_cap must be a whole number (got: $PER_RUN_CAP)"
+  exit 1
+fi
+PER_RUN_CAP=${PER_RUN_CAP//_/}
+
 if [ -z "${PYBIN:-}" ]; then
   _py=$(toml_val pybin || true)
   if [ -n "$_py" ]; then
@@ -138,11 +145,20 @@ fi
 
 if [ "${#CHANNELS[@]}" -eq 0 ]; then
   echo "no matching channels in $CHANNELS_FILE"
+  [ "$#" -gt 0 ] && exit 1
+  echo "sync: 0 channels, 0 failed"
   exit 0
 fi
 
+NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$'
+failed=0
 for entry in "${CHANNELS[@]}"; do
   SOURCE="${entry%%|*}"
+  if [[ ! $SOURCE =~ $NAME_RE ]] || [[ $SOURCE == *..* ]]; then
+    echo "  skip $SOURCE: invalid source name (letters, digits, dot, dash, underscore; no ..)"
+    failed=$((failed + 1))
+    continue
+  fi
   rest="${entry#*|}"
   HANDLE="${rest%%|*}"
   URL="${rest##*|}"
@@ -151,8 +167,8 @@ for entry in "${CHANNELS[@]}"; do
   mkdir -p "$CAP_DIR"
   echo "-- $SOURCE ($HANDLE) --"
 
-  yt-dlp ${YT_COOKIES[@]+"${YT_COOKIES[@]}"} --flat-playlist --print "%(id)s\t%(title)s" "$URL" \
-    > "$DATA_DIR/$SOURCE/video-list.tsv" 2>/dev/null || { echo "  list refresh failed"; continue; }
+  yt-dlp ${YT_COOKIES[@]+"${YT_COOKIES[@]}"} --flat-playlist --print "%(id)s\t%(title)s" -- "$URL" \
+    > "$DATA_DIR/$SOURCE/video-list.tsv" 2>/dev/null || { echo "  list refresh failed"; failed=$((failed + 1)); continue; }
   cut -f1 "$DATA_DIR/$SOURCE/video-list.tsv" > "$DATA_DIR/$SOURCE/all-ids.txt"
 
   pulled=0
@@ -164,7 +180,7 @@ for entry in "${CHANNELS[@]}"; do
     fi
     [ "$pulled" -ge "$PER_RUN_CAP" ] && break
     if yt-dlp ${YT_COOKIES[@]+"${YT_COOKIES[@]}"} --write-auto-subs --sub-langs en --skip-download \
-      -o "$CAP_DIR/%(id)s.%(ext)s" "https://youtu.be/$vid" >/dev/null 2>&1; then
+      -o "$CAP_DIR/%(id)s.%(ext)s" -- "https://youtu.be/$vid" >/dev/null 2>&1; then
       ok=1
     else
       ok=0
@@ -176,6 +192,10 @@ for entry in "${CHANNELS[@]}"; do
   done < "$DATA_DIR/$SOURCE/all-ids.txt"
   echo "  pulled up to $pulled new caption files"
 
-  "$PYBIN" "$INGEST" --captions "$CAP_DIR" --titles "$DATA_DIR/$SOURCE/video-list.tsv" \
-    --source "$SOURCE" --channel "$HANDLE"
+  if ! "$PYBIN" "$INGEST" --captions "$CAP_DIR" --titles "$DATA_DIR/$SOURCE/video-list.tsv" \
+    --source "$SOURCE" --channel "$HANDLE"; then
+    failed=$((failed + 1))
+  fi
 done
+echo "sync: ${#CHANNELS[@]} channels, $failed failed"
+[ "$failed" -eq 0 ]

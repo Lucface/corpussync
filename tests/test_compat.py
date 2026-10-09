@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from tests.conftest import REPO, isolated_env
 
 
@@ -54,11 +56,10 @@ def test_compat_flags_parse_and_stats_runs(tmp_path):
 
 
 def test_sync_sh_parses_on_bash_without_mapfile():
-    """source: bash -n sync.sh passes and sync.sh contains no mapfile."""
+    """source: sync.sh must parse on system bash and avoid features missing from bash 3.2."""
     text = (REPO / "sync.sh").read_text(encoding="utf-8")
-    assert "mapfile" not in text
-    assert "declare -A" not in text
-    assert ",," not in text
+    for feature in ("mapfile", "declare -A", ",,", "readarray", "declare -n", "local -n", "coproc", "^^", "|&", "&>>"):
+        assert feature not in text
     assert "corpussync.py" in text
     assert "--captions" in text
     assert "--titles" in text
@@ -66,7 +67,7 @@ def test_sync_sh_parses_on_bash_without_mapfile():
     assert "--channel" in text
     assert "COOKIE_JAR" in text
     assert "exported from your own account" in text
-    proc = subprocess.run(["bash", "-n", str(REPO / "sync.sh")], capture_output=True, text=True)
+    proc = subprocess.run(["/bin/bash", "-n", str(REPO / "sync.sh")], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
     assert Path(REPO / "sync.sh").exists()
 
@@ -89,3 +90,48 @@ def test_compat_remote_notice_precedes_legacy_probe(home, monkeypatch, capsys):
     assert main_compat(["--source", "notes", "--captions", str(home / "captions")], probe=probe) == 2
     assert calls == [("https://legacy.example/collections", 1)]
     assert "no Qdrant server answers" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("override", [None, "custom"])
+def test_compat_ingest_keeps_bare_collection_untouched(ctx, tmp_path, capsys, override):
+    """source: the 0.1 ingest must use source-corpus or its explicit override even when a bare source collection exists."""
+    from corpussync.cli import main_compat
+    from corpussync.store import ensure_collection, point_count
+
+    ensure_collection(ctx.client, "demo", ctx.settings.embed_dim)
+    ctx.close()
+    captions = tmp_path / "captions"
+    captions.mkdir()
+    (captions / "demo.en.vtt").write_text("WEBVTT\n\n" + " ".join(f"word{i}" for i in range(40)))
+    args = ["--source", "demo", "--captions", str(captions)]
+    if override:
+        args.extend(["--collection", override])
+    assert main_compat(args) == 0
+    target = override or "demo-corpus"
+    assert point_count(ctx.client, "demo") == 0
+    assert point_count(ctx.client, target) == 1
+    ctx.close()
+    capsys.readouterr()
+    stats_args = ["--source", "demo", "--stats"]
+    if override:
+        stats_args.extend(["--collection", override])
+    assert main_compat(stats_args) == 0
+    assert f"{target}: 1 points" in capsys.readouterr().out
+
+
+def test_compat_port_only_probe(home, monkeypatch):
+    """source: the compat privacy probe must pass settings through when only QDRANT_PORT was exported."""
+    from types import SimpleNamespace
+    from corpussync.cli import main_compat
+    from tests.test_state import make_legacy
+
+    make_legacy(home / "ingestion-state.db")
+    monkeypatch.setenv("QDRANT_PORT", "16333")
+    calls = []
+
+    def probe(url, timeout):
+        calls.append((url, timeout))
+        return SimpleNamespace(status_code=503)
+
+    assert main_compat(["--source", "demo", "--captions", str(home / "captions")], probe=probe) == 2
+    assert calls == [("http://127.0.0.1:16333/collections", 1)]

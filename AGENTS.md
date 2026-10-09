@@ -4,7 +4,7 @@ CorpusSync builds a searchable local corpus from notes, documents, transcripts, 
 
 ## Setup
 
-Python 3.9 or newer. Runtime dependencies are `qdrant-client` and `requests`. Optional extras: `pdf` (`pypdf`), `docx` (`python-docx`), and `dev` (`pytest`).
+Python 3.9 or newer. Runtime dependencies are `qdrant-client` (1.10 or newer), `requests`, and `tomli` on Python 3.9 and 3.10. Optional extras: `pdf` (`pypdf`), `docx` (`python-docx`), and `dev` (`pytest`, `setuptools`).
 
 ```bash
 python3 -m venv .venv

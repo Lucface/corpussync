@@ -126,6 +126,31 @@ def test_legacy_choice_answering_server(home, monkeypatch, capsys):
     assert str(path) in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("port_source", ["environment", "config", "default"])
+def test_legacy_probe_uses_resolved_port(home, monkeypatch, port_source):
+    """source: port-only legacy configuration must probe QDRANT_PORT, then the TOML port, then 6333."""
+    from corpussync.store import legacy_address
+
+    make_legacy(home / "ingestion-state.db")
+    if port_source != "default":
+        (home / "corpussync.toml").write_text("[qdrant]\nport = 26333\n")
+    if port_source == "environment":
+        monkeypatch.setenv("QDRANT_PORT", "16333")
+    port = {"environment": 16333, "config": 26333, "default": 6333}[port_source]
+    settings = load_settings()
+    assert not settings.using_server()
+    assert legacy_address(settings) == f"http://127.0.0.1:{port}"
+    calls = []
+
+    def probe(url, timeout):
+        calls.append((url, timeout))
+        return SimpleNamespace(status_code=200)
+
+    assert legacy_store_choice(settings, probe) == "server"
+    assert settings.qdrant_url == f"http://127.0.0.1:{port}"
+    assert calls == [(f"http://127.0.0.1:{port}/collections", 1)]
+
+
 def test_legacy_choice_failure_stops_compat(home, capsys):
     """source: defect 27, missing legacy server exits 2 instead of forking private corpora."""
     from corpussync.cli import main_compat

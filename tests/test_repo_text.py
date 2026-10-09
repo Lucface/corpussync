@@ -57,11 +57,14 @@ def test_channels_example_has_only_placeholder_handles():
 
 
 def test_modules_defer_annotations_and_parse_on_python39():
-    """source: defect 15, every package and test module defers annotations and uses Python 3.9 syntax."""
+    """source: every nonempty module defers annotations and parses on Python 3.9; tests has an empty package marker."""
     import ast
 
     paths = list((REPO / "corpussync").glob("*.py")) + list((REPO / "tests").glob("*.py")) + [REPO / "corpussync.py"]
     for path in paths:
+        if path == REPO / "tests" / "__init__.py":
+            assert path.read_bytes() == b""
+            continue
         tree = ast.parse(path.read_text(), feature_version=(3, 9))
         statements = tree.body
         if statements and isinstance(statements[0], ast.Expr) and isinstance(statements[0].value, ast.Constant) and isinstance(statements[0].value.value, str):
@@ -73,7 +76,7 @@ def test_modules_defer_annotations_and_parse_on_python39():
 
 
 def test_setup_metadata_and_legacy_editable_entry():
-    """source: defect 2 and round 3 item 6, metadata resolves the package version and keeps the Python 3.9 CLI."""
+    """source: metadata resolves the package version and declares TOML and dev dependencies for Python 3.9."""
     import configparser
 
     config = configparser.ConfigParser()
@@ -82,7 +85,11 @@ def test_setup_metadata_and_legacy_editable_entry():
     assert config["metadata"]["version"] == "attr: corpussync.__init__.__version__"
     assert config["options"]["packages"] == "corpussync"
     assert config["options"]["python_requires"] == ">=3.9"
-    assert config["options"]["install_requires"].split() == ["qdrant-client>=1.10", "requests>=2.31"]
+    assert config["options"]["install_requires"].strip().splitlines() == [
+        "qdrant-client>=1.10", "requests>=2.31", 'tomli>=1.1; python_version < "3.11"',
+    ]
     assert config["options.entry_points"]["console_scripts"].strip() == "corpussync = corpussync.cli:main"
-    assert dict(config["options.extras_require"]) == {"pdf": "pypdf>=4", "docx": "python-docx>=1.1", "dev": "pytest>=8"}
+    assert {key: value.split() for key, value in config["options.extras_require"].items()} == {
+        "pdf": ["pypdf>=4"], "docx": ["python-docx>=1.1"], "dev": ["pytest>=8", "setuptools>=61"],
+    }
     assert (REPO / "setup.py").read_text() == "from setuptools import setup\nsetup()\n"

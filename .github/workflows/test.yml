@@ -21,4 +21,17 @@ jobs:
       - name: Install
         run: pip install -e ".[dev,pdf,docx]"
       - name: Test
-        run: pytest -q
+        run: python -m pytest -q
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+      - name: Install
+        run: pip install -e ".[dev,pdf,docx]"
+      - name: Test
+        run: python -m pytest -q

@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from corpussync.config import load_settings, loads_toml_minimal
+from corpussync.config import load_settings
 from tests.conftest import REPO, run_cli
 
 
@@ -155,20 +155,6 @@ def test_env_overrides_toml(tmp_path, monkeypatch):
     assert settings.embed_model == "from-env"
     assert settings.home == wanted
     assert settings.answer_model == "llama3.2"
-
-
-def test_minimal_toml_reader_parses_tables():
-    """source: the Python 3.10 fallback reader parses the config tables."""
-    sample = '[search.min_score]\ndense = 0.5\nkeyword = 1\nhybrid = 0.0\n\n[qdrant]\nurl = "http://127.0.0.1:6333"\n'
-    got = loads_toml_minimal(sample)
-    assert got["search"]["min_score"]["dense"] == 0.5
-    assert got["search"]["min_score"]["keyword"] == 1
-    assert got["search"]["min_score"]["hybrid"] == 0.0
-    assert got["qdrant"]["url"] == "http://127.0.0.1:6333"
-    if sys.version_info >= (3, 11):
-        import tomllib
-
-        assert tomllib.loads(sample)["search"]["min_score"]["dense"] == 0.5
 
 
 def test_remove_missing_never_deletes(ctx, monkeypatch, capsys):

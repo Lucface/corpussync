@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from qdrant_client.models import FieldCondition
+from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, VectorParams
 
 from corpussync.ingest import ingest_document, ingest_paths, speaker_from_title
 
@@ -142,6 +142,41 @@ def test_hidden_files_are_skipped_and_title_falls_back_to_stem(ctx, tmp_path):
     assert "modified_at" in payload
 
 
+def test_explicit_dot_folder_is_scanned(ctx, tmp_path):
+    """source: round 4 item 3, an explicitly supplied dot folder must be scanned."""
+    root = tmp_path / ".notes"
+    root.mkdir()
+    path = root / "idea.md"
+    path.write_text("# Idea\n\nfive words make this note\n")
+    assert ingest_paths(ctx, [root], "notes") == 0
+    points = _scroll(ctx, "notes")
+    assert len(points) == 1
+    assert points[0].payload["source_file"] == str(path.resolve())
+
+
+def test_explicit_parent_component_is_scanned(ctx, tmp_path):
+    """source: round 4 item 3, a command line path ending in .. must scan its parent."""
+    root = tmp_path / "a"
+    sub = root / "sub"
+    sub.mkdir(parents=True)
+    path = root / "idea.md"
+    path.write_text("# Idea\n\nfive words make this note\n")
+    assert ingest_paths(ctx, [sub / ".."], "notes") == 0
+    points = _scroll(ctx, "notes")
+    assert len(points) == 1
+    assert points[0].payload["source_file"] == str(path.resolve())
+
+
+def test_explicit_dot_file_is_ingested(ctx, tmp_path):
+    """source: round 4 item 3, an explicitly supplied dot file must be ingested."""
+    path = tmp_path / ".idea.md"
+    path.write_text("# Idea\n\nfive words make this note\n")
+    assert ingest_paths(ctx, [path], "notes") == 0
+    points = _scroll(ctx, "notes")
+    assert len(points) == 1
+    assert points[0].payload["source_file"] == str(path.resolve())
+
+
 def test_speaker_from_title_falls_back_to_the_channel_handle():
     """source: speaker_from_title reads a short tail after a dash, else the channel handle."""
     assert speaker_from_title("A plain title", "@YourChannel") == "@YourChannel"
@@ -207,6 +242,30 @@ def test_prune_deleted_renamed_and_keep_missing(ctx, tmp_path, capsys):
     (root / "new.txt").unlink()
     assert ingest_paths(ctx, [root], "notes") == 0
     assert _scroll(ctx, "notes") == []
+
+
+def test_prune_keeps_existing_file_inside_hidden_folder(ctx, tmp_path, capsys):
+    """source: round 4 item 3, a file excluded from scanning keeps points while it still exists."""
+    root = tmp_path / "notes"
+    path = root / ".drafts" / "idea.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("# Idea\n\nfive words make this note\n")
+    selector = Filter(must=[
+        FieldCondition(key="source_file", match=MatchValue(value=str(path.resolve()))),
+    ])
+    assert ingest_paths(ctx, [path], "notes") == 0
+    before = ctx.client.count("notes-corpus", count_filter=selector, exact=True).count
+    assert before == 1
+    capsys.readouterr()
+    assert ingest_paths(ctx, [root], "notes") == 0
+    assert ctx.client.count("notes-corpus", count_filter=selector, exact=True).count == before
+    assert ctx.db.execute(
+        "SELECT path FROM ingest_state WHERE collection=? AND path=?",
+        ("notes-corpus", str(path.resolve())),
+    ).fetchall() == [(str(path.resolve()),)]
+    output = capsys.readouterr().out
+    assert not any("removed " in line for line in output.splitlines())
+    assert "DONE: 0 files, 0 chunks, 0 removed, 0 skipped, 0 failed -> notes-corpus" in output
 
 
 def test_file_and_missing_root_never_prune(ctx, tmp_path):
@@ -316,6 +375,77 @@ def test_caption_digest_matches_raw_legacy_hash_and_rebuild(ctx, tmp_path, capsy
     assert counter.docs == 3
     assert len(_scroll(ctx, "notes")) == 2
     assert "DONE: 2 files, 2 chunks, 0 failed -> notes-corpus" in capsys.readouterr().out
+
+
+def test_legacy_talk_prefix_is_embedded_without_changing_payload(ctx, tmp_path, monkeypatch):
+    """source: round 4 item 8, unnamed vectors retain the talk prefix and plain payload; hybrid stays plain."""
+    from corpussync.ingest import ingest_youtube
+
+    ctx.client.create_collection(
+        "legacy-corpus",
+        vectors_config=VectorParams(size=ctx.settings.embed_dim, distance=Distance.COSINE),
+    )
+    root = tmp_path / "captions"
+    root.mkdir()
+    (root / "demo.en.vtt").write_text(
+        "WEBVTT\n\n00:00:00.000 --> 00:00:05.000\n" + _words(800) + "\n",
+    )
+    titles = tmp_path / "titles.tsv"
+    titles.write_text("demo\tA plain talk\n")
+    calls = []
+    original = ctx.embedder.embed_documents
+
+    def record(texts, prefixed=True):
+        calls.append((list(texts), prefixed))
+        return original(texts, prefixed=prefixed)
+
+    monkeypatch.setattr(ctx.embedder, "embed_documents", record)
+    assert ingest_youtube(ctx, root, titles, "legacy", "@YourChannel", "silver", False) == 0
+    points = sorted(_scroll(ctx, "legacy"), key=lambda point: point.payload["chunk_index"])
+    texts = [text for batch, _prefixed in calls for text in batch]
+    assert len(texts) == len(points) > 1
+    assert all(prefixed is False for _batch, prefixed in calls)
+    prefix = "[talk] [@YourChannel] [@YourChannel]: "
+    assert all(text.startswith(prefix) for text in texts)
+    assert texts == [prefix + point.payload["text"] for point in points]
+    assert all(not point.payload["text"].startswith("[talk]") for point in points)
+
+    calls.clear()
+    assert ingest_youtube(ctx, root, titles, "hybrid", "@YourChannel", "silver", False) == 0
+    hybrid = sorted(_scroll(ctx, "hybrid"), key=lambda point: point.payload["chunk_index"])
+    texts = [text for batch, _prefixed in calls for text in batch]
+    assert len(texts) == len(hybrid) == len(points)
+    assert all(prefixed is True for _batch, prefixed in calls)
+    assert all(not text.startswith("[talk]") for text in texts)
+    assert texts == [point.payload["text"] for point in hybrid]
+    assert texts == [point.payload["text"] for point in points]
+
+
+@pytest.mark.parametrize("fields", [{}, {"channel": "@YourChannel"}, {"author": "Alex Example"}])
+def test_legacy_talk_allows_missing_prefix_fields(ctx, tmp_path, monkeypatch, fields):
+    """source: item E, a talk supplied through the Python API must tolerate missing channel or author."""
+    ctx.client.create_collection(
+        "legacy-corpus",
+        vectors_config=VectorParams(size=ctx.settings.embed_dim, distance=Distance.COSINE),
+    )
+    calls = []
+    original = ctx.embedder.embed_documents
+
+    def record(texts, prefixed=True):
+        calls.append((list(texts), prefixed))
+        return original(texts, prefixed=prefixed)
+
+    monkeypatch.setattr(ctx.embedder, "embed_documents", record)
+    text = _words(40)
+    assert ingest_document(
+        ctx, text=text, source_file=str(tmp_path / "talk.txt"), corpus="legacy",
+        title="A plain talk", locator="talk.txt", extra_payload={"doc_type": "talk", **fields},
+    ) == 1
+    channel, author = fields.get("channel", ""), fields.get("author", "")
+    assert calls == [([f"[talk] [{channel}] [{author}]: {text}"], False)]
+    points = _scroll(ctx, "legacy")
+    assert len(points) == 1
+    assert points[0].payload["text"] == text
 
 
 def test_missing_and_failed_captions_return_one(ctx, tmp_path, monkeypatch, capsys):

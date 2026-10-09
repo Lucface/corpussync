@@ -31,8 +31,6 @@ def config_template() -> str:
 # Uncomment a line to override its default.
 # Precedence: command-line flags, then environment variables, then this file, then defaults.
 # Root keys stay above the tables. Uncomment a key where it sits.
-# On Python 3.9 and 3.10 this file uses a minimal parser (comments, tables, strings, numbers, booleans).
-# Python 3.11 and newer use tomllib.
 
 # home = "{DEFAULT_HOME}"
 # answer_model = "{DEFAULT_ANSWER_MODEL}"
@@ -68,88 +66,18 @@ def config_template() -> str:
 """
 
 
-def loads_toml_minimal(text: str) -> dict:
-    """Small TOML reader for the keys this project writes. Used on Python 3.9 and 3.10."""
-    root: dict = {}
-    current = root
-
-    def strip_comment(line: str) -> str:
-        out: list[str] = []
-        quote = None
-        for ch in line:
-            if quote:
-                out.append(ch)
-                if ch == quote:
-                    quote = None
-                continue
-            if ch in ('"', "'"):
-                quote = ch
-                out.append(ch)
-                continue
-            if ch == "#":
-                break
-            out.append(ch)
-        return "".join(out).strip()
-
-    def parse_value(raw: str):
-        if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
-            return raw[1:-1].replace('\\"', '"').replace("\\\\", "\\")
-        if len(raw) >= 2 and raw[0] == "'" and raw[-1] == "'":
-            return raw[1:-1]
-        if raw == "true":
-            return True
-        if raw == "false":
-            return False
-        if _is_int(raw):
-            return int(raw)
-        if _is_float(raw):
-            return float(raw)
-        raise ValueError(f"unsupported toml value: {raw}")
-
-    for raw_line in text.splitlines():
-        line = strip_comment(raw_line)
-        if not line:
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            section = line[1:-1].strip()
-            node = root
-            for part in section.split("."):
-                if part not in node or not isinstance(node[part], dict):
-                    node[part] = {}
-                node = node[part]
-            current = node
-            continue
-        if "=" not in line:
-            raise ValueError(f"unsupported toml line: {line}")
-        key, val = line.split("=", 1)
-        current[key.strip()] = parse_value(val.strip())
-    return root
-
-
-def _is_int(raw: str) -> bool:
-    if not raw:
-        return False
-    body = raw[1:] if raw[0] in "+-" else raw
-    return bool(body) and body.isdigit()
-
-
-def _is_float(raw: str) -> bool:
-    if raw.count(".") != 1:
-        return False
-    left, right = raw.split(".")
-    return _is_int(left) and bool(right) and right.isdigit()
-
-
-def load_toml_text(text: str) -> dict:
-    if sys.version_info >= (3, 11):
-        import tomllib
-
-        return tomllib.loads(text)
-    return loads_toml_minimal(text)
-
-
 def load_toml_file(path: Path) -> dict:
-    return load_toml_text(path.read_text(encoding="utf-8"))
+    if sys.version_info >= (3, 11):
+        import tomllib as toml
+    else:
+        try:
+            import tomli as toml
+        except ImportError:
+            raise SystemExit(
+                f"corpussync needs tomli on Python 3.9 and 3.10 to read {path}. "
+                "Run: pip install tomli"
+            ) from None
+    return toml.loads(path.read_text(encoding="utf-8"))
 
 
 def _present(value) -> bool:
@@ -281,7 +209,7 @@ def _resolve_qdrant(env_map: dict, toml_map: dict) -> tuple[str | None, str | No
             if not _present(port):
                 port = _pick("qdrant_port", env_map, toml_map, default=DEFAULT_QDRANT_PORT)
             return None, str(source["qdrant_host"]), int(port)
-    return None, None, DEFAULT_QDRANT_PORT
+    return None, None, int(_pick("qdrant_port", env_map, toml_map, default=DEFAULT_QDRANT_PORT))
 
 
 @dataclass

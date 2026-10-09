@@ -137,13 +137,13 @@ def resolve_collection(ctx, corpus: str) -> str | None:
     return None
 
 
-def legacy_address() -> str:
-    return os.environ.get("CORPUSSYNC_LEGACY_QDRANT", "http://127.0.0.1:6333").rstrip("/")
+def legacy_address(settings: Settings) -> str:
+    return os.environ.get("CORPUSSYNC_LEGACY_QDRANT", f"http://127.0.0.1:{settings.qdrant_port}").rstrip("/")
 
 
-def legacy_server_answers(probe) -> bool:
+def legacy_server_answers(settings: Settings, probe) -> bool:
     try:
-        return probe(f"{legacy_address()}/collections", timeout=1).status_code == 200
+        return probe(f"{legacy_address(settings)}/collections", timeout=1).status_code == 200
     except Exception:
         return False
 
@@ -156,8 +156,8 @@ def legacy_store_choice(settings, probe) -> str:
     path = legacy_state_path(settings)
     if path is None:
         return "embedded"
-    legacy = legacy_address()
-    if legacy_server_answers(probe):
+    legacy = legacy_address(settings)
+    if legacy_server_answers(settings, probe):
         settings.qdrant_url = legacy
         print(
             f"using the Qdrant server at {legacy}, where 0.1 kept its corpora (0.1 state: {path}); "
