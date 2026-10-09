@@ -1,62 +1,165 @@
 #!/usr/bin/env bash
-# sync.sh — incremental ingest of tracked YouTube channels into per-channel Qdrant corpora.
-# For each channel in a channels file: refresh the video-id list, pull FREE auto-captions
-# for ids not yet on disk (yt-dlp, no API/transcription cost), then embed+upsert via
-# corpussync.py. Hash-skip means only new videos embed, so it's idempotent + re-runnable.
+# sync.sh: incremental ingest of tracked YouTube channels into per-channel Qdrant corpora.
+# For each channel in a channels file: refresh the video-id list, pull auto-captions
+# for ids not yet on disk (yt-dlp, no API key, no transcription cost), then embed and
+# upsert via corpussync.py. Hash-skip means only new videos embed.
 #
 # Usage:
 #   ./sync.sh                       # all channels in ./channels.txt
-#   ./sync.sh ycombinator           # only matching source(s)
+#   ./sync.sh mychannel             # only matching source(s)
 #   CHANNELS_FILE=mine.txt ./sync.sh
 #
-# channels file format (one per line):   source|@handle|https://www.youtube.com/@handle/videos
-# Optional: set COOKIE_JAR=/path/to/cookies.txt to pull authenticated (dodges YouTube's
-# unauthenticated bot-throttle). Export PER_RUN_CAP to cap caption pulls per channel/run.
+# channels file format (one per line):   source|@handle|URL
+# COOKIE_JAR: a yt-dlp cookies file exported from your own account, for when
+# YouTube limits requests without one.
+# PER_RUN_CAP caps new caption pulls per channel per run (default 250).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 INGEST="$HERE/corpussync.py"
-CHANNELS_FILE="${CHANNELS_FILE:-$HERE/channels.txt}"
-DATA_DIR="${CORPUSSYNC_DATA:-$HOME/.corpussync/channels}"
-PER_RUN_CAP="${PER_RUN_CAP:-250}"
-PYBIN="${PYBIN:-python3}"
 
-command -v yt-dlp >/dev/null || { echo "yt-dlp not found — install it first (brew install yt-dlp)"; exit 1; }
+toml_val() {
+  local key file line val
+  key="$1"
+  file="$HERE/corpussync.toml"
+  [ -f "$file" ] || return 0
+  line=$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null | head -n 1 || true)
+  [ -z "$line" ] && return 0
+  val=${line#*=}
+  val=$(printf '%s' "$val" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]\+#.*$//')
+  case "$val" in
+    \"*\") val=${val#\"}; val=${val%\"} ;;
+    \'*\') val=${val#\'}; val=${val%\'} ;;
+  esac
+  printf '%s' "$val"
+}
+
+expand_tilde() {
+  case "$1" in
+    "~")
+      printf '%s' "$HOME"
+      ;;
+    "~/"*)
+      printf '%s/%s' "$HOME" "${1#~/}"
+      ;;
+    *)
+      printf '%s' "$1"
+      ;;
+  esac
+}
+
+if [ -z "${CHANNELS_FILE:-}" ]; then
+  _cf=$(toml_val channels_file || true)
+  if [ -n "$_cf" ]; then
+    case "$_cf" in
+      "~"|"~/"*) CHANNELS_FILE=$(expand_tilde "$_cf") ;;
+      /*) CHANNELS_FILE="$_cf" ;;
+      *) CHANNELS_FILE="$HERE/$_cf" ;;
+    esac
+  else
+    CHANNELS_FILE="$HERE/channels.txt"
+  fi
+fi
+
+if [ -z "${CORPUSSYNC_DATA:-}" ]; then
+  _dd=$(toml_val data_dir || true)
+  if [ -n "$_dd" ]; then
+    CORPUSSYNC_DATA=$(expand_tilde "$_dd")
+  else
+    CORPUSSYNC_DATA="$HOME/.corpussync/channels"
+  fi
+fi
+DATA_DIR="$CORPUSSYNC_DATA"
+
+if [ -z "${PER_RUN_CAP:-}" ]; then
+  _cap=$(toml_val per_run_cap || true)
+  if [ -n "$_cap" ]; then
+    PER_RUN_CAP="$_cap"
+  else
+    PER_RUN_CAP=250
+  fi
+fi
+
+if [ -z "${PYBIN:-}" ]; then
+  _py=$(toml_val pybin || true)
+  if [ -n "$_py" ]; then
+    PYBIN="$_py"
+  else
+    PYBIN="python3"
+  fi
+fi
+
+if [ -z "${COOKIE_JAR:-}" ]; then
+  _cj=$(toml_val cookie_jar || true)
+  if [ -n "$_cj" ]; then
+    COOKIE_JAR=$(expand_tilde "$_cj")
+  fi
+fi
+
+command -v yt-dlp >/dev/null || { echo "yt-dlp not found. Install it first (brew install yt-dlp)"; exit 1; }
 [ -f "$CHANNELS_FILE" ] || { echo "no channels file at $CHANNELS_FILE (copy channels.example.txt)"; exit 1; }
 
 YT_COOKIES=()
-[ -n "${COOKIE_JAR:-}" ] && [ -s "${COOKIE_JAR:-}" ] && YT_COOKIES=(--cookies "$COOKIE_JAR")
+if [ -n "${COOKIE_JAR:-}" ] && [ -s "${COOKIE_JAR}" ]; then
+  YT_COOKIES=(--cookies "$COOKIE_JAR")
+fi
 
-# optional positional filter
-mapfile -t CHANNELS < <(grep -vE '^\s*#|^\s*$' "$CHANNELS_FILE")
+CHANNELS=()
+while IFS= read -r entry; do
+  [ -z "$entry" ] && continue
+  CHANNELS+=("$entry")
+done << CS_END
+$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$CHANNELS_FILE" || true)
+CS_END
+
 if [ "$#" -gt 0 ]; then
-  _f=(); for want in "$@"; do for e in "${CHANNELS[@]}"; do [ "${e%%|*}" = "$want" ] && _f+=("$e"); done; done
-  CHANNELS=("${_f[@]}")
+  _f=()
+  if [ "${#CHANNELS[@]}" -gt 0 ]; then
+    for want in "$@"; do
+      for e in "${CHANNELS[@]}"; do
+        if [ "${e%%|*}" = "$want" ]; then
+          _f+=("$e")
+        fi
+      done
+    done
+  fi
+  CHANNELS=()
+  if [ "${#_f[@]}" -gt 0 ]; then
+    for e in "${_f[@]}"; do
+      CHANNELS+=("$e")
+    done
+  fi
+fi
+
+if [ "${#CHANNELS[@]}" -eq 0 ]; then
+  echo "no matching channels in $CHANNELS_FILE"
+  exit 0
 fi
 
 for entry in "${CHANNELS[@]}"; do
-  SOURCE="${entry%%|*}"; rest="${entry#*|}"; HANDLE="${rest%%|*}"; URL="${rest##*|}"
-  CAP_DIR="$DATA_DIR/$SOURCE/captions"; mkdir -p "$CAP_DIR"
-  echo "── $SOURCE ($HANDLE) ──"
+  SOURCE="${entry%%|*}"
+  rest="${entry#*|}"
+  HANDLE="${rest%%|*}"
+  URL="${rest##*|}"
+  CAP_DIR="$DATA_DIR/$SOURCE/captions"
+  mkdir -p "$CAP_DIR"
+  echo "-- $SOURCE ($HANDLE) --"
 
-  # 1. refresh id + title list (cheap flat-playlist; no downloads)
-  yt-dlp "${YT_COOKIES[@]}" --flat-playlist --print "%(id)s\t%(title)s" "$URL" \
+  yt-dlp ${YT_COOKIES[@]+"${YT_COOKIES[@]}"} --flat-playlist --print "%(id)s\t%(title)s" "$URL" \
     > "$DATA_DIR/$SOURCE/video-list.tsv" 2>/dev/null || { echo "  list refresh failed"; continue; }
   cut -f1 "$DATA_DIR/$SOURCE/video-list.tsv" > "$DATA_DIR/$SOURCE/all-ids.txt"
 
-  # 2. pull captions only for ids not already on disk (capped per run)
   pulled=0
   while IFS= read -r vid; do
     [ -z "$vid" ] && continue
     ls "$CAP_DIR/$vid".*.vtt >/dev/null 2>&1 && continue
     [ "$pulled" -ge "$PER_RUN_CAP" ] && break
-    yt-dlp "${YT_COOKIES[@]}" --write-auto-subs --sub-langs en --skip-download \
+    yt-dlp ${YT_COOKIES[@]+"${YT_COOKIES[@]}"} --write-auto-subs --sub-langs en --skip-download \
       -o "$CAP_DIR/%(id)s.%(ext)s" "https://youtu.be/$vid" >/dev/null 2>&1 || true
-    pulled=$((pulled+1))
+    pulled=$((pulled + 1))
   done < "$DATA_DIR/$SOURCE/all-ids.txt"
   echo "  pulled up to $pulled new caption files"
 
-  # 3. embed + upsert (hash-skip => only new videos cost anything)
   "$PYBIN" "$INGEST" --captions "$CAP_DIR" --titles "$DATA_DIR/$SOURCE/video-list.tsv" \
     --source "$SOURCE" --channel "$HANDLE"
 done

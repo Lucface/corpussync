@@ -1,52 +1,117 @@
+[![tests](https://github.com/Lucface/corpussync/actions/workflows/test.yml/badge.svg)](https://github.com/Lucface/corpussync/actions/workflows/test.yml)
+
 # CorpusSync
 
-Turn any **YouTube channel into a queryable Qdrant corpus — for free.** CorpusSync pulls a channel's auto-captions with `yt-dlp` (no API key, no transcription cost), cleans the rolling-duplication mess YouTube auto-subs produce into real prose, chunks + embeds it with a local Ollama embedder (`nomic-embed-text`, 768d), and upserts into a per-channel Qdrant collection. Re-runs are hash-skipped, so a daily sync only embeds new videos.
+Build a searchable corpus from your own notes, documents, transcripts and your channel's captions, on your own machine, for free.
 
-Point it at a creator you learn from and your coding agent can query their whole back-catalog as an intelligence corpus.
+## Respect what you index
 
-## How it works
-
-```
-yt-dlp (free captions) ──▶ clean_vtt() ──▶ chunk (512-tok windows) ──▶ Ollama embed ──▶ Qdrant <source>-corpus
-        no API cost            de-dupes         64-tok overlap          nomic 768d        deterministic IDs, hash-skip
-```
-
-The one non-obvious piece is `clean_vtt()`: YouTube auto-subs animate — each cue re-shows the previous partial line plus a few new words, so every sentence appears 2–3× with inline `<timing>` tags. CorpusSync strips the tags and collapses the roll-up back into clean prose before embedding.
+Index what you own or are allowed to use, and follow each platform's terms.
 
 ## Quick start
 
-```bash
-pip install -r requirements.txt        # qdrant-client + requests
-# you need a running Qdrant (localhost:6333) and Ollama with nomic-embed-text:
-#   ollama pull nomic-embed-text
-
-cp channels.example.txt channels.txt   # edit to your channels
-./sync.sh                              # pulls captions + ingests all channels
-./sync.sh ycombinator                  # just one
-```
-
-Or ingest a directory of `.vtt` files you already have:
+Python 3.10 or newer.
 
 ```bash
-python3 corpussync.py --captions ./captions --titles video-list.tsv --source aiengineer --channel "@aiDotEngineer"
-python3 corpussync.py --source aiengineer --stats     # point count
+pip install -e ".[pdf,docx]"
+ollama pull nomic-embed-text
+corpussync init
+corpussync ingest ./notes --corpus notes
+corpussync search "your question" --corpus notes
 ```
 
-## Config (env vars, all optional)
+`pip install -e ".[dev,pdf,docx]"` adds pytest. The `pdf` and `docx` extras are optional.
 
-| Var | Default | |
-|---|---|---|
-| `QDRANT_HOST` / `QDRANT_PORT` | `127.0.0.1` / `6333` | where Qdrant lives (remote over an SSH tunnel works — calls auto-retry through blips) |
-| `OLLAMA_HOST` / `OLLAMA_PORT` | `127.0.0.1` / `11434` | the embedder |
-| `CORPUSSYNC_EMBED_MODEL` / `CORPUSSYNC_EMBED_DIM` | `nomic-embed-text` / `768` | swap the embedder (match the dim) |
-| `CORPUSSYNC_STATE` | `~/.corpussync/ingestion-state.db` | hash-skip state DB |
-| `COOKIE_JAR` | — | path to a `yt-dlp` cookie jar to pull authenticated (avoids YouTube's unauthenticated throttle) |
-| `PER_RUN_CAP` | `250` | max new caption pulls per channel per run |
+## YouTube captions
 
-## Payload shape
+```bash
+cp channels.example.txt channels.txt
+# edit channels.txt: source|@handle|URL
+./sync.sh
+```
 
-Each point carries `doc_type, source, channel, source_name, video_id, url, title, author, quality_tier, chunk_index, chunk_total, text`. Stable across versions — any Qdrant query client reads it unchanged. Re-ingesting a longer edit of a video overwrites chunks `0..N-1` and deletes stale trailing chunks *after* the upsert, so the video is never momentarily missing.
+`./sync.sh` pulls captions with yt-dlp and no API key. `clean_vtt` collapses the rolling repeats of auto-captions.
+
+A caption directory you already have:
+
+```bash
+python3 corpussync.py --captions ./captions --titles video-list.tsv --source mychannel --channel "@YourChannel"
+python3 corpussync.py --source mychannel --stats
+```
+
+`COOKIE_JAR` is a yt-dlp cookies file exported from your own account, for when YouTube limits requests without one.
+
+## Qdrant server
+
+With `QDRANT_URL`, `QDRANT_HOST`, and `qdrant.url` unset, CorpusSync stores vectors in an embedded Qdrant database at `~/.corpussync/qdrant`. Set `QDRANT_URL`, or set `QDRANT_HOST` and `QDRANT_PORT`, or set `qdrant.url` in `corpussync.toml`, to use a Qdrant server.
+
+## Hybrid search
+
+Hybrid search asks the store for a dense vector match and a keyword match, then fuses the two lists with reciprocal rank fusion. Use `--mode hybrid` (the default), `--mode dense`, or `--mode keyword`.
+
+## Ask
+
+`corpussync ask "your question" --corpus notes` runs a search, then asks a local Ollama chat model to answer only from the numbered sources and to cite them as `[n]`. The model is `answer_model` (default `llama3.2`). Pass `--model NAME` to override it for one question. If nothing clears the relevance floor, ask prints the refusal and exits 2 without calling the model.
+
+## Coding agents
+
+`corpussync search "your question" --corpus notes --json` prints one JSON object. The process exits 0 when at least one result clears the relevance floor. It exits 2 when none does, and prints `no good match in: <corpora>`.
+
+`corpussync stats --corpus notes` prints a point count. `corpussync list` prints each corpus with its point count and layout. `corpussync doctor` checks that Ollama answers, that the embed model is pulled, that the store opens, and whether `yt-dlp` is on `PATH` (a warning only).
+
+## Configuration
+
+Command-line flags win, then environment variables, then `corpussync.toml`, then defaults. The file is read from `--config PATH`, then `./corpussync.toml`, then `$CORPUSSYNC_HOME/corpussync.toml`. `corpussync init` writes the file with every key commented at its default. On Python 3.10 the file is read by a minimal parser (comments, tables, strings, numbers, and booleans). Python 3.11 and newer use `tomllib`.
+
+| Environment variable | TOML key | Default |
+| --- | --- | --- |
+| `QDRANT_URL` | `qdrant.url` | unset |
+| `QDRANT_HOST` | `qdrant.host` | unset |
+| `QDRANT_PORT` | `qdrant.port` | `6333` |
+| `OLLAMA_HOST` | `ollama.host` | `127.0.0.1` |
+| `OLLAMA_PORT` | `ollama.port` | `11434` |
+| `CORPUSSYNC_EMBED_MODEL` | `embed.model` | `nomic-embed-text` |
+| `CORPUSSYNC_EMBED_DIM` | `embed.dim` | `768` |
+| `CORPUSSYNC_EMBEDDER` | `embed.backend` | `ollama` (`fake` for tests) |
+| `CORPUSSYNC_CHAT` | `chat.backend` | `ollama` (`fake` for tests) |
+|  | `answer_model` | `llama3.2` |
+| `CORPUSSYNC_STATE` | `state.path` | `$CORPUSSYNC_HOME/state.db` |
+| `CORPUSSYNC_HOME` | `home` | `~/.corpussync` |
+| `CORPUSSYNC_DATA` | `data_dir` | `~/.corpussync/channels` |
+| `CHANNELS_FILE` | `channels_file` | `channels.txt` beside `sync.sh` |
+| `PER_RUN_CAP` | `per_run_cap` | `250` |
+| `PYBIN` | `pybin` | `python3` |
+| `COOKIE_JAR` | `cookie_jar` | unset |
+|  | `search.min_score.dense` | `0.2` |
+|  | `search.min_score.keyword` | `0.05` |
+|  | `search.min_score.hybrid` | `0.0` |
+
+`CORPUSSYNC_EMBEDDER` and `CORPUSSYNC_CHAT` accept `ollama` or `fake`. When the model name contains `nomic-embed`, documents are prefixed with `search_document: ` and queries with `search_query: `.
+
+## Stop and remove
+
+Nothing runs in the background. Ctrl-C stops a sync. Remove one corpus with `corpussync remove --corpus NAME --yes`. Remove the local data by deleting `~/.corpussync`. Uninstall with `pip uninstall corpussync`.
+
+## What leaves your machine
+
+What leaves your machine: only the requests yt-dlp makes to YouTube when you sync a channel; embeddings, storage and answers stay local.
+
+## Upgrading from 0.1
+
+Collections created by 0.1 keep working in dense mode. Search prints a one-line notice that `--mode hybrid` needs a fresh corpus (`corpussync remove --corpus NAME --yes`, then ingest again). `./sync.sh` and `python3 corpussync.py --captions ... --source ... --channel ...` still work, and `python3 corpussync.py --source NAME --stats` still prints a count.
+
+## Payload
+
+A YouTube point keeps `doc_type` `talk`, `source` `youtube`, `channel`, `source_name`, `source_file`, `video_id`, `url`, `title`, `author`, `publish_date`, `quality_tier`, `chunk_index`, `chunk_total`, `text`, `ingested_at`, and `expires_at`.
+
+A file point has `doc_type` `file`, `source` `files`, `source_name` (the corpus), `source_file` (absolute path), `locator` (path relative to the ingested root), `title` (first markdown or html heading, otherwise the file stem), `chunk_index`, `chunk_total`, `text`, `ingested_at`, and `modified_at`.
+
+Point ids are `uuid5(NAMESPACE_URL, "{source_file}::{index}")`. Re-ingest overwrites those ids, then deletes chunks with `chunk_index` greater than or equal to the new count.
+
+## Python API
+
+`corpussync.vtt.clean_vtt(raw)` and `corpussync.vtt.clean_srt(raw)` return prose. `corpussync.chunking.chunk(text, max_tokens=512, overlap=64)` returns windows. `corpussync.ingest.ingest_document(ctx, *, text, source_file, corpus, title, locator, extra_payload=None, force=False)` returns the number of chunks written, or 0 when the content hash is unchanged. `corpussync.search.search(ctx, query, corpora, k=8, mode="hybrid")` returns a `SearchResult` with `.results` and `.coverage`.
 
 ## License
 
-MIT — see [LICENSE](./LICENSE). By [@Lucface](https://github.com/Lucface).
+MIT, see LICENSE.
